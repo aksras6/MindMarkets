@@ -1,0 +1,449 @@
+--- ibapi_appv1.py
++++ ibapi_appv1_patched.py
+@@ -32,6 +32,9 @@
+ import sys
+ import time
+ from typing import List, Dict, Optional, Tuple
++
++from strategies.base import BaseStrategy
++from strategies.adx_squeeze import AdxSqueezeBreakout
+ from dataclasses import dataclass
+ import pandas as pd
+ import numpy as np
+@@ -519,15 +522,17 @@
+             print(f"[ORD] cancelOrder({oid}) error: {e}")
+ 
+ # =========================== Backtester ===========================
+-def backtest_portfolio(dfs_by_symbol: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[str, any], pd.DataFrame]:
+-    # (unchanged from previous message; omitted here for brevity in comments)
++
++def backtest_portfolio(
++    dfs_by_symbol: Dict[str, pd.DataFrame],
++    strategy: BaseStrategy,
++    ACCOUNT_SIZE: float = ACCOUNT_SIZE,
++    COMMISSION_PER_SH: float = COMMISSION_PER_SH,
++    SLIPPAGE_PER_SH: float = SLIPPAGE_PER_SH
++) -> Tuple[pd.DataFrame, Dict[str, any], pd.DataFrame]:
+     dfs = {}
+     for sym, df in dfs_by_symbol.items():
+-        d = df.copy()
+-        d = d.dropna(subset=["open", "high", "low", "close"])
+-        d["ADX"] = adx_wilder(d[["high", "low", "close"]], ADXLEN)
+-        d["HH"] = d["high"].rolling(LEN, min_periods=LEN).max()
+-        d["LL"] = d["low"].rolling(LEN, min_periods=LEN).min()
++        d = strategy.prepare(df)
+         dfs[sym] = d
+ 
+     if not dfs:
+@@ -546,27 +551,42 @@
+     trades: List[Trade] = []
+     equity_curve = np.zeros(n)
+ 
++    # compute warmup start
+     start_idx = 0
+     for i in range(n):
+-        if i >= WARMUP_BARS:
++        if i >= strategy.warmup_bars:
+             start_idx = i
+             break
+-
+-    equity_curve[:] = 0.0
+-    equity_curve[: start_idx + 1] = ACCOUNT_SIZE
+-
+-    for i in range(start_idx, n - 1):
++    if n > 0:
++        equity_curve[: min(start_idx+1, n)] = ACCOUNT_SIZE
++
++    def _stop_entry_fill(next_open, next_high, stop_price):
++        if any(pd.isna(x) for x in (next_open, next_high, stop_price)):
++            return None
++        if next_high >= stop_price:
++            raw = max(stop_price, next_open)
++            return raw + SLIPPAGE_PER_SH
++        return None
++
++    def _stop_exit_fill(next_open, next_low, stop_price):
++        if any(pd.isna(x) for x in (next_open, next_low, stop_price)):
++            return None
++        if next_low <= stop_price:
++            raw = min(stop_price, next_open)
++            return raw - SLIPPAGE_PER_SH
++        return None
++
++    for i in range(start_idx, max(0, n-1)):
+         next_i = i + 1
+ 
++        # exits (use "LL" if available, else use previous close as placeholder)
+         to_close = []
+         for sym, pos in positions.items():
+             d = dfs[sym]
+-            exit_stop = d["LL"].iloc[i]
+-            if pd.isna(exit_stop):
+-                continue
++            stop_loss = d["LL"].iloc[i] if "LL" in d.columns else d["close"].iloc[i] * 0.95
+             nb_open = d["open"].iloc[next_i]
+-            nb_low = d["low"].iloc[next_i]
+-            exit_fill = stop_exit_fill_price(nb_open, nb_low, exit_stop)
++            nb_low  = d["low"].iloc[next_i]
++            exit_fill = _stop_exit_fill(nb_open, nb_low, stop_loss)
+             if exit_fill is not None:
+                 comm = pos.shares * COMMISSION_PER_SH
+                 pnl = (exit_fill - pos.entry_price) * pos.shares - comm
+@@ -585,87 +605,83 @@
+         for sym in to_close:
+             positions.pop(sym, None)
+ 
+-        max_positions_left = MAX_POSITIONS - len(positions)
+-        gross = sum(dfs[s]["close"].iloc[i] * positions[s].shares for s in positions)
+-        exposure_pct = 100.0 * gross / max(equity, 1e-9)
+-
+-        if max_positions_left > 0 and exposure_pct < MAX_EXPOSURE_PCT - 1e-9:
+-            entry_candidates = []
+-            for sym in syms:
+-                if sym in positions:
+-                    continue
+-                d = dfs[sym]
+-                adx_i = d["ADX"].iloc[i]
+-                if pd.isna(adx_i) or adx_i >= ADXTHRESH:
+-                    continue
+-                entry_stop = d["HH"].iloc[i]
+-                if pd.isna(entry_stop):
+-                    continue
+-                nb_open = d["open"].iloc[next_i]
+-                nb_high = d["high"].iloc[next_i]
+-                entry_fill = stop_entry_fill_price(nb_open, nb_high, entry_stop)
+-                if entry_fill is None:
+-                    continue
+-                dollar_target = equity * (TRADE_PCT / 100.0)
+-                shares = int(dollar_target // entry_fill)
+-                if shares <= 0:
+-                    continue
+-                comm = shares * COMMISSION_PER_SH
+-                cost = shares * entry_fill + comm
+-                if cost > cash + 1e-9:
+-                    continue
+-                entry_candidates.append((sym, shares, entry_fill, comm))
+-
+-            for sym, shares, entry_fill, comm in entry_candidates:
+-                if len(positions) >= MAX_POSITIONS:
+-                    break
+-                gross = sum(dfs[s]["close"].iloc[i] * positions[s].shares for s in positions) + shares * entry_fill
+-                exposure_pct = 100.0 * gross / max(equity, 1e-9)
+-                if exposure_pct > MAX_EXPOSURE_PCT + 1e-9:
+-                    continue
+-                cash -= shares * entry_fill + comm
+-                positions[sym] = Position(
+-                    symbol=sym,
+-                    shares=shares,
+-                    entry_price=entry_fill,
+-                    entry_idx=next_i,
+-                    equity_at_entry=equity
+-                )
++        # entries with caps
++        if len(positions) < strategy.max_positions:
++            gross = sum(dfs[s]["close"].iloc[i] * positions[s].shares for s in positions)
++            exposure_pct = 100.0 * gross / max(equity, 1e-9)
++            if exposure_pct < strategy.max_exposure_pct - 1e-9:
++                for sym in syms:
++                    if sym in positions:
++                        continue
++                    d = dfs[sym]
++                    if not strategy.is_eligible(d.iloc[i]):
++                        continue
++                    spec = strategy.next_entry_spec(sym, d.iloc[i])
++                    if spec is None:
++                        continue
++                    entry_stop, protective_stop = spec
++                    nb_open = d["open"].iloc[next_i]
++                    nb_high = d["high"].iloc[next_i]
++                    entry_fill = _stop_entry_fill(nb_open, nb_high, entry_stop)
++                    if entry_fill is None:
++                        continue
++                    shares = strategy.shares_for_entry(entry_fill, equity)
++                    if shares <= 0:
++                        continue
++                    comm = shares * COMMISSION_PER_SH
++                    cost = shares * entry_fill + comm
++                    if cost > cash + 1e-9:
++                        continue
++                    # exposure check after
++                    gross_after = gross + shares * entry_fill
++                    if 100.0 * gross_after / max(equity, 1e-9) > strategy.max_exposure_pct + 1e-9:
++                        continue
++
++                    cash -= shares * entry_fill + comm
++                    positions[sym] = Position(symbol=sym, shares=shares, entry_price=entry_fill, entry_idx=next_i, equity_at_entry=equity)
++                    gross = gross_after
++                    if len(positions) >= strategy.max_positions:
++                        break
+ 
+         close_mv = sum(dfs[s]["close"].iloc[next_i] * positions[s].shares for s in positions)
+         equity = cash + close_mv
+         equity_curve[next_i] = equity
+ 
++    # flatten
+     final_i = n - 1
+-    for sym, pos in list(positions.items()):
+-        px = dfs[sym]["close"].iloc[final_i]
+-        comm = pos.shares * COMMISSION_PER_SH
+-        pnl = (px - pos.entry_price) * pos.shares - comm
+-        trades.append(Trade(
+-            symbol=sym,
+-            entry_date=all_index[pos.entry_idx],
+-            exit_date=all_index[final_i],
+-            entry_price=pos.entry_price,
+-            exit_price=px,
+-            shares=pos.shares,
+-            pnl=pnl,
+-            ret_pct=(px / pos.entry_price - 1.0) * 100.0
+-        ))
+-        cash += pos.shares * px - comm
+-        positions.pop(sym, None)
+-    equity = cash
+-    equity_curve[final_i] = equity
+-
+-    eq = pd.Series(equity_curve, index=all_index).replace(0.0, np.nan).ffill().fillna(ACCOUNT_SIZE)
++    if final_i >= 0:
++        for sym, pos in list(positions.items()):
++            px = dfs[sym]["close"].iloc[final_i]
++            comm = pos.shares * COMMISSION_PER_SH
++            pnl = (px - pos.entry_price) * pos.shares - comm
++            trades.append(Trade(
++                symbol=sym,
++                entry_date=all_index[pos.entry_idx],
++                exit_date=all_index[final_i],
++                entry_price=pos.entry_price,
++                exit_price=px,
++                shares=pos.shares,
++                pnl=pnl,
++                ret_pct=(px / pos.entry_price - 1.0) * 100.0
++            ))
++            cash += pos.shares * px - comm
++            positions.pop(sym, None)
++
++    equity = cash if n > 0 else ACCOUNT_SIZE
++    if n > 0:
++        equity_curve[final_i] = equity
++        eq = pd.Series(equity_curve, index=all_index).replace(0.0, np.nan).ffill().fillna(ACCOUNT_SIZE)
++    else:
++        eq = pd.Series([ACCOUNT_SIZE])
++
+     returns = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+ 
+     periods = len(eq)
+     net_profit = eq.iloc[-1] - ACCOUNT_SIZE
+     ror = (eq.iloc[-1] / ACCOUNT_SIZE - 1.0) * 100.0
+-
+     running_max = eq.cummax()
+     dd = (eq - running_max) / running_max
+-    max_dd_pct = dd.min() * 100.0
++    max_dd_pct = float(dd.min() * 100.0) if len(dd) else 0.0
+ 
+     trades_df = pd.DataFrame([t.__dict__ for t in trades]) if trades else pd.DataFrame(
+         columns=["symbol","entry_date","exit_date","entry_price","exit_price","shares","pnl","ret_pct"]
+@@ -678,11 +694,12 @@
+     gross_loss = -trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum() if n_trades else 0.0
+     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+ 
+-    ret_std = returns.std(ddof=1)
+-    ret_mean = returns.mean()
+-    sharpe = (np.sqrt(252.0) * ret_mean / ret_std) if (ret_std is not None and ret_std > 0) else np.nan
++    sharpe = np.nan
++    if len(returns) > 2 and returns.std(ddof=1) > 0:
++        sharpe = float(np.sqrt(252.0) * returns.mean() / returns.std(ddof=1))
+ 
+     summary = {
++        "Strategy": strategy.name,
+         "Periods": periods,
+         "NetProfit": round(float(net_profit), 2),
+         "ROR": round(float(ror), 2),
+@@ -695,65 +712,8 @@
+         "StartEquity": ACCOUNT_SIZE,
+     }
+ 
+-    equity_df = pd.DataFrame({"date": all_index, "equity": eq.values})
+-
++    equity_df = pd.DataFrame({"date": eq.index, "equity": eq.values})
+     return trades_df, summary, equity_df
+-
+-# =========================== Per-symbol KPI breakdown ===========================
+-def kpis_by_symbol(trades_df: pd.DataFrame) -> pd.DataFrame:
+-    if trades_df.empty:
+-        cols = ["symbol","Trades","NetProfit","PctWins","ProfitFactor","AvgRetPct","MedianRetPct"]
+-        return pd.DataFrame(columns=cols)
+-
+-    gp = trades_df.groupby("symbol", dropna=False)
+-
+-    kpis = gp.agg(
+-        Trades=("pnl","count"),
+-        NetProfit=("pnl","sum"),
+-        Wins=("pnl", lambda s: (s > 0).sum() ),
+-        GrossProfit=("pnl", lambda s: s[s > 0].sum()),
+-        GrossLoss=("pnl", lambda s: -s[s < 0].sum()),
+-        AvgRetPct=("ret_pct","mean"),
+-        MedianRetPct=("ret_pct","median"),
+-    ).reset_index()
+-
+-    kpis["PctWins"] = np.where(kpis["Trades"] > 0, 100.0 * kpis["Wins"] / kpis["Trades"], 0.0)
+-    kpis["ProfitFactor"] = np.where(kpis["GrossLoss"] > 0, kpis["GrossProfit"] / kpis["GrossLoss"], np.inf)
+-
+-    kpis = kpis.drop(columns=["Wins","GrossProfit","GrossLoss"])
+-    kpis["NetProfit"] = kpis["NetProfit"].round(2)
+-    kpis["PctWins"] = kpis["PctWins"].round(2)
+-    kpis["ProfitFactor"] = kpis["ProfitFactor"].replace(np.inf, np.nan).round(2).fillna("Inf")
+-    kpis["AvgRetPct"] = kpis["AvgRetPct"].round(3)
+-    kpis["MedianRetPct"] = kpis["MedianRetPct"].round(3)
+-
+-    return kpis[["symbol","Trades","NetProfit","PctWins","ProfitFactor","AvgRetPct","MedianRetPct"]]
+-
+-# =========================== Save CSV helpers ===========================
+-def save_csvs(output_dir: str, trades_df: pd.DataFrame, summary: Dict[str, any], equity_df: pd.DataFrame):
+-    os.makedirs(output_dir, exist_ok=True)
+-
+-    trades_path = os.path.join(output_dir, "adx_trades.csv")
+-    trades_df.to_csv(trades_path, index=False)
+-
+-    equity_path = os.path.join(output_dir, "adx_equity.csv")
+-    equity_df.to_csv(equity_path, index=False)
+-
+-    sym_kpis_df = kpis_by_symbol(trades_df)
+-    sym_kpis_path = os.path.join(output_dir, "adx_kpis_by_symbol.csv")
+-    sym_kpis_df.to_csv(sym_kpis_path, index=False)
+-
+-    port_kpis_df = pd.DataFrame([summary])
+-    port_kpis_path = os.path.join(output_dir, "adx_kpis_portfolio.csv")
+-    port_kpis_df.to_csv(port_kpis_path, index=False)
+-
+-    print(f"\\n[OUT] Saved:")
+-    print(f" - Trades:        {trades_path}")
+-    print(f" - Equity curve:  {equity_path}")
+-    print(f" - KPIs by sym:   {sym_kpis_path}")
+-    print(f" - KPIs portfolio:{port_kpis_path}")
+-
+-# =========================== Orchestration (Historical Backtest) ===========================
+ def run_download_and_backtest(
+     symbols: List[str],
+     host: str = "127.0.0.1",
+@@ -785,7 +745,8 @@
+             return pd.DataFrame(), {}
+ 
+         print("[BT] Running backtest…")
+-        trades_df, summary, equity_df = backtest_portfolio(usable)
++        strat = AdxSqueezeBreakout(len_channel=LEN, adx_len=ADXLEN, adx_thresh=ADXTHRESH, trade_pct=TRADE_PCT, max_positions=MAX_POSITIONS, max_exposure_pct=MAX_EXPOSURE_PCT)
++        trades_df, summary, equity_df = backtest_portfolio(usable, strat)
+ 
+         print("\\n=== Backtest KPIs (Portfolio) ===")
+         for k, v in summary.items():
+@@ -831,7 +792,7 @@
+     child.transmit = True
+     return [parent, child]
+ 
+-def latest_completed_daily_df(app: IbApp, symbol: str) -> pd.DataFrame:
++def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -> pd.DataFrame:
+     contract = resolve_contract(app, symbol)
+     if contract is None:
+         return pd.DataFrame()
+@@ -844,20 +805,15 @@
+     if df.empty:
+         return df
+ 
+-    d = df.dropna(subset=["open","high","low","close"]).copy()
+-    d["ADX"] = adx_wilder(d[["high","low","close"]], ADXLEN)
+-    d["HH"]  = d["high"].rolling(LEN, min_periods=LEN).max()
+-    d["LL"]  = d["low"].rolling(LEN, min_periods=LEN).min()
+-    return d
++    return strategy.prepare(df.dropna(subset=["open","high","low","close"]).copy())
+ 
+ def place_paper_orders_now(
+     symbols: List[str],
++    strategy: BaseStrategy,
+     host: str="127.0.0.1",
+-    port: int=7497,         # 7497 = PAPER (7496 = LIVE)
++    port: int=7497,
+     client_id: int=44,
+-    equity: float=ACCOUNT_SIZE,
+-    max_positions: int=MAX_POSITIONS,
+-    max_exposure_pct: float=MAX_EXPOSURE_PCT
++    equity: float=ACCOUNT_SIZE
+ ):
+     """
+     Idempotent: checks existing open parent BUY STP brackets and skips if identical,
+@@ -885,11 +841,11 @@
+         gross_target = 0.0
+ 
+         for sym in symbols:
+-            if open_count >= max_positions:
++            if open_count >= strategy.max_positions:
+                 break
+ 
+-            d = latest_completed_daily_df(app, sym)
+-            if d.empty or len(d) < max(LEN, ADXLEN) + 1:
++            d = latest_completed_daily_df(app, sym, strategy)
++            if d.empty or len(d) < strategy.warmup_bars + 1:
+                 print(f"[DRY][{sym}] insufficient data; skipping")
+                 continue
+ 
+@@ -912,7 +868,7 @@
+                 print(f"[DRY][{sym}] qty=0 at stop {hh:.2f}; skipping")
+                 continue
+ 
+-            if (gross_target + qty * hh) / equity * 100.0 > max_exposure_pct + 1e-9:
++            if (gross_target + qty * hh) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
+                 print(f"[DRY][{sym}] exposure cap would be exceeded; skipping")
+                 continue
+ 
+@@ -976,12 +932,11 @@
+ 
+ def roll_daily_brackets_after_close(
+     symbols: List[str],
++    strategy: BaseStrategy,
+     host: str="127.0.0.1",
+-    port: int=7497,      # Paper
++    port: int=7497,
+     client_id: int=55,
+-    equity: float=ACCOUNT_SIZE,
+-    max_positions: int=MAX_POSITIONS,
+-    max_exposure_pct: float=MAX_EXPOSURE_PCT
++    equity: float=ACCOUNT_SIZE
+ ):
+     """
+     After US close:
+@@ -1015,11 +970,11 @@
+         gross_target = 0.0
+ 
+         for sym in symbols:
+-            if open_count >= max_positions:
++            if open_count >= strategy.max_positions:
+                 break
+ 
+-            d = latest_completed_daily_df(app, sym)
+-            if d.empty or len(d) < max(LEN, ADXLEN) + 1:
++            d = latest_completed_daily_df(app, sym, strategy)
++            if d.empty or len(d) < strategy.warmup_bars + 1:
+                 print(f"[ROLL][{sym}] insufficient data; skipping")
+                 continue
+ 
+@@ -1041,7 +996,7 @@
+                 print(f"[ROLL][{sym}] qty=0 at stop {hh:.2f}; skipping")
+                 continue
+ 
+-            if (gross_target + qty * hh) / equity * 100.0 > max_exposure_pct + 1e-9:
++            if (gross_target + qty * hh) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
+                 print(f"[ROLL][{sym}] exposure cap would be exceeded; skipping")
+                 continue
+ 
+@@ -1098,10 +1053,12 @@
+     symbols = ["MSFT", "NVDA", "AAPL", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "WMT", "JPM", "V", "SPY", "BRK.A"]
+ 
+     if args.roll:
+-        roll_daily_brackets_after_close(symbols, port=7497, client_id=56)
++        strat = AdxSqueezeBreakout(len_channel=LEN, adx_len=ADXLEN, adx_thresh=ADXTHRESH, trade_pct=TRADE_PCT, max_positions=MAX_POSITIONS, max_exposure_pct=MAX_EXPOSURE_PCT)
++        roll_daily_brackets_after_close(symbols, strategy=strat, port=7497, client_id=56)
+     else:
+         # Option A: historical backtest + CSV outputs
+         # run_download_and_backtest(symbols, output_dir="output")
+ 
+         # Option B: place PAPER breakout orders now based on latest completed daily bar (idempotent)
+-        place_paper_orders_now(symbols, port=7497, client_id=44)
++        strat = AdxSqueezeBreakout(len_channel=LEN, adx_len=ADXLEN, adx_thresh=ADXTHRESH, trade_pct=TRADE_PCT, max_positions=MAX_POSITIONS, max_exposure_pct=MAX_EXPOSURE_PCT)
++        place_paper_orders_now(symbols, strategy=strat, port=7497, client_id=44)
