@@ -39,9 +39,42 @@ from datetime import datetime, timezone
 import os
 from types import SimpleNamespace
 
+
 # === Strategy interfaces ===
 from strategies.base import BaseStrategy
 from strategies.adx_squeeze import AdxSqueezeBreakout
+from strategies.rsi_breakout import RsiBreakout
+
+
+# --- Strategy registry for easy selection/extension ---
+STRATEGY_REGISTRY = {
+    "adx_squeeze": lambda **kw: AdxSqueezeBreakout(**kw),
+    "rsi_breakout": lambda **kw: RsiBreakout(**kw),   # <-- add this line
+    # "my_new": lambda **kw: MyNewStrategy(**kw),
+}
+
+# Which kwargs each strategy accepts (allow-list)
+STRATEGY_PARAM_KEYS = {
+    "adx_squeeze": {
+        "len_channel", "adx_len", "adx_thresh",
+        "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars",
+    },
+    "rsi_breakout": {
+        "len_channel", "rsi_len", "rsi_thresh",
+        "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars",
+    },
+}
+
+
+def build_strategy(name: str, **overrides) -> BaseStrategy:
+    key = (name or "adx_squeeze").strip().lower()
+    if key not in STRATEGY_REGISTRY:
+        raise ValueError(f"Unknown strategy '{name}'. Known: {', '.join(STRATEGY_REGISTRY)}")
+
+    allowed = STRATEGY_PARAM_KEYS.get(key, set())
+    clean = {k: v for k, v in overrides.items() if k in allowed and v is not None}
+    return STRATEGY_REGISTRY[key](**clean)
+
 
 # =========================== Parameters (RealTest parity) ===========================
 LEN = 20                 # channel lookback
@@ -677,16 +710,31 @@ def backtest_portfolio(
     equity = cash
     equity_curve[final_i] = equity
 
+        # Equity & returns (use post-warmup segment to avoid flat early curve)
     eq = pd.Series(equity_curve, index=all_index).replace(0.0, np.nan).ffill().fillna(ACCOUNT_SIZE)
-    returns = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    eq_eff = eq.iloc[start_idx:]  # effective equity segment (after warmup)
+    returns = (
+        eq_eff.pct_change()
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
 
-    periods = len(eq)
-    net_profit = eq.iloc[-1] - ACCOUNT_SIZE
-    ror = (eq.iloc[-1] / ACCOUNT_SIZE - 1.0) * 100.0
+    periods = len(eq_eff)  # bars considered (post-warmup)
+    start_equity_eff = float(eq_eff.iloc[0])
+    final_equity = float(eq_eff.iloc[-1])
 
-    running_max = eq.cummax()
-    dd = (eq - running_max) / running_max
-    max_dd_pct = dd.min() * 100.0
+    net_profit = final_equity - start_equity_eff
+    total_return_pct = (final_equity / start_equity_eff - 1.0) * 100.0
+
+    # Annualised CAGR using trading-day convention (252)
+    n_days = max(1, returns.shape[0])
+    cagr_pct = ((final_equity / start_equity_eff) ** (252.0 / n_days) - 1.0) * 100.0
+
+    # Max drawdown (positive percent)
+    running_max = eq_eff.cummax()
+    dd = (eq_eff - running_max) / running_max
+    max_dd_pct = float(abs(dd.min()) * 100.0)
+
 
     trades_df = pd.DataFrame([t.__dict__ for t in trades]) if trades else pd.DataFrame(
         columns=["symbol","entry_date","exit_date","entry_price","exit_price","shares","pnl","ret_pct"]
@@ -703,19 +751,40 @@ def backtest_portfolio(
     ret_mean = returns.mean()
     sharpe = (np.sqrt(252.0) * ret_mean / ret_std) if (ret_std is not None and ret_std > 0) else np.nan
 
+    # Annualised volatility (optional)
+    ann_vol_pct = float(returns.std(ddof=1) * np.sqrt(252.0) * 100.0) if returns.shape[0] > 2 else np.nan
+
     summary = {
         "Strategy": strategy.name,
-        "Periods": periods,
-        "NetProfit": round(float(net_profit), 2),
-        "ROR": round(float(ror), 2),
-        "MaxDD": round(float(max_dd_pct), 2),
+        "BarsUsed": periods,                      # post-warmup bars
+        "StartEquity": round(float(start_equity_eff), 2),
+        "FinalEquity": round(float(final_equity), 2),
+
+        # Returns
+        "TotalReturnPct": round(float(total_return_pct), 2),
+        "CAGR": round(float(cagr_pct), 2),
+        "ROR": round(float(total_return_pct), 2),  # backward-compat alias for TotalReturnPct
+
+        # Risk
+        "MaxDDPct": round(float(max_dd_pct), 2),
+        "Calmar": (
+            round(float((cagr_pct / max_dd_pct)) , 3)
+            if (max_dd_pct > 0 and np.isfinite(cagr_pct)) else "NA"
+        ),
+        "Sharpe": round(float(sharpe), 3) if pd.notna(sharpe) else "NA",
+
+        # Trading stats
         "Trades": int(n_trades),
         "PctWins": round(float(pct_wins), 2),
         "ProfitFactor": round(float(profit_factor), 2) if np.isfinite(profit_factor) else "Inf",
-        "Sharpe": round(float(sharpe), 3) if pd.notna(sharpe) else "NA",
-        "FinalEquity": round(float(eq.iloc[-1]), 2),
-        "StartEquity": ACCOUNT_SIZE,
+
+        # Original fields retained
+        "NetProfit": round(float(net_profit), 2),
+
+        "AnnVolPct": round(ann_vol_pct, 2) if pd.notna(ann_vol_pct) else "NA",
+
     }
+
 
     equity_df = pd.DataFrame({"date": all_index, "equity": eq.values})
 
@@ -855,6 +924,7 @@ def create_bracket_buy(parent_id: int, qty: int, entry_stop: float, stop_loss: f
     return [parent, child]
 
 def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -> pd.DataFrame:
+    """Fetch latest daily bars for `symbol` and return `strategy.prepare(df)` with indicators."""
     contract = resolve_contract(app, symbol)
     if contract is None:
         return pd.DataFrame()
@@ -1052,7 +1122,7 @@ def roll_daily_brackets_after_close(
                 print(f"[ROLL][{sym}] NaN indicator(s); skipping")
                 continue
             if not strategy.is_eligible(last):
-                #print(f"[ROLL][{sym}] ADX={adx:.1f} ≥ {ADXTHRESH}; not eligible")
+                #print(f"[ROLL][{sym}] not eligible by {strategy.name}")
                 continue
 
             qty = strategy.shares_for_entry(hh, equity)
@@ -1114,37 +1184,78 @@ def roll_daily_brackets_after_close(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--roll", action="store_true", help="Cancel/skip/replace daily brackets after US close")
+    parser = argparse.ArgumentParser(description="IBKR ADX Squeeze — backtest / trade / roll")
+    # Modes
+    parser.add_argument("--trade", action="store_true", help="Place idempotent paper orders for current signals")
+    parser.add_argument("--roll", action="store_true", help="Cancel/replace bracket orders after US close")
+    parser.add_argument("--backtest", action="store_true", help="Run historical backtest (downloads daily bars)")
+    # Connection
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7497, help="7497 paper, 7496 live")
+    parser.add_argument("--client-id", type=int, default=44)
+    # Symbols
+    parser.add_argument("--symbols", nargs="*", help="Space-separated symbols. If omitted, uses the default list.")
+    parser.add_argument("--symbols-file", help="Path to a text file with one symbol per line")
+    # Strategy selection + overrides
+    parser.add_argument("--strategy", default="adx_squeeze", help="Strategy key (see registry)")
+    parser.add_argument("--len-channel", type=int, default=None)
+    parser.add_argument("--adx-len", type=int, default=None)
+    parser.add_argument("--adx-thresh", type=float, default=None)
+    parser.add_argument("--trade-pct", type=float, default=None)
+    parser.add_argument("--max-positions", type=int, default=None)
+    parser.add_argument("--max-exposure-pct", type=float, default=None)
+    parser.add_argument("--warmup-bars", type=int, default=None)
+    parser.add_argument("--rsi-len", type=int, default=None)
+    parser.add_argument("--rsi-thresh", type=float, default=None)
+
+    # Utilities
+    parser.add_argument("--force-roll", action="store_true", help="Run roll even if not after US close")
+    parser.add_argument("--preview", action="store_true", help="Preview actions without placing orders (trade/roll)")
+    parser.add_argument("--outdir", default="output", help="Backtest output folder")
+    parser.add_argument("--price-tol", type=float, default=None, help="Treat stops equal within this absolute amount")
     args = parser.parse_args()
-
-    symbols = ["MSFT", "NVDA", "AAPL", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "WMT", "JPM", "V", "SPY", "BRK.A"]
-
-    # Instantiate strategy with current parameters
-    strat = AdxSqueezeBreakout(
-        len_channel=LEN,
-        adx_len=ADXLEN,
-        adx_thresh=ADXTHRESH,
-        trade_pct=TRADE_PCT,
-        max_positions=MAX_POSITIONS,
-        max_exposure_pct=MAX_EXPOSURE_PCT,
-        warmup_bars=WARMUP_BARS
-    )
-
-    if args.roll:
-        roll_daily_brackets_after_close(symbols, strategy=strat, port=7497, client_id=56)
+    
+    if args.price_tol is not None:
+        PRICE_TOL = float(args.price_tol)
+    # Symbols (CLI overrides default)
+    if args.symbols_file:
+        with open(args.symbols_file, "r", encoding="utf-8") as fh:
+            symbols = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    elif args.symbols:
+        symbols = args.symbols
     else:
-        # Option A: historical backtest + CSV outputs
+        symbols = ["MSFT", "NVDA", "AAPL", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "WMT", "JPM", "V", "SPY", "BRK.A"]
+    # Strategy instantiation (CLI overrides fall back to your constants)
+    overrides = {}
+    if args.len_channel is not None: overrides["len_channel"] = args.len_channel
+    if args.adx_len is not None: overrides["adx_len"] = args.adx_len
+    if args.adx_thresh is not None: overrides["adx_thresh"] = args.adx_thresh
+    if args.rsi_len is not None: overrides["rsi_len"] = args.rsi_len
+    if args.rsi_thresh is not None: overrides["rsi_thresh"] = args.rsi_thresh
+
+    if args.trade_pct is not None: overrides["trade_pct"] = args.trade_pct
+    if args.max_positions is not None: overrides["max_positions"] = args.max_positions
+    if args.max_exposure_pct is not None: overrides["max_exposure_pct"] = args.max_exposure_pct
+    if args.warmup_bars is not None: overrides["warmup_bars"] = args.warmup_bars
+    overrides.setdefault("len_channel", LEN)
+    overrides.setdefault("adx_len", ADXLEN)
+    overrides.setdefault("adx_thresh", ADXTHRESH)
+    overrides.setdefault("trade_pct", TRADE_PCT)
+    overrides.setdefault("max_positions", MAX_POSITIONS)
+    overrides.setdefault("max_exposure_pct", MAX_EXPOSURE_PCT)
+    overrides.setdefault("warmup_bars", WARMUP_BARS)
+    strat = build_strategy(args.strategy, **overrides)
+    # --- Mode routing ---
+    if args.backtest:
         usable = {}
         app = IbApp()
         try:
-            app.connect("127.0.0.1", 7497, clientId=99)
-            import threading, time
+            app.connect(args.host, args.port, clientId=args.client_id)
+            import threading
             reader = threading.Thread(target=app.run, daemon=True)
             reader.start()
             if not app.connected_evt.wait(10):
                 raise TimeoutError("Failed to connect to IB for historical download")
-
             for sym in symbols:
                 df = latest_completed_daily_df(app, sym, strategy=strat)
                 if not df.empty:
@@ -1152,9 +1263,20 @@ if __name__ == "__main__":
         finally:
             if app.isConnected():
                 app.disconnect()
-
         trades_df, summary, equity_df = backtest_portfolio(usable, strategy=strat)
-        save_csvs("output", trades_df, summary, equity_df)
-
-        # Option B: place PAPER breakout orders now based on latest completed daily bar (idempotent)
-        #place_paper_orders_now(symbols, strategy=strat, port=7497, client_id=44)
+        os.makedirs(args.outdir, exist_ok=True)
+        save_csvs(args.outdir, trades_df, summary, equity_df)
+        print(f"[BACKTEST] Saved CSVs to: {args.outdir}")
+    elif args.roll:
+        if args.force_roll:
+            def _ok(): return True
+            globals()["_after_us_close_now"] = _ok
+        if args.preview:
+            print("[PREVIEW] Roll would run now (no orders placed).")
+        else:
+            roll_daily_brackets_after_close(symbols, strategy=strat, host=args.host, port=args.port, client_id=args.client_id)
+    else:
+        if args.preview:
+            print("[PREVIEW] Would place paper orders now (no orders placed).")
+        else:
+            place_paper_orders_now(symbols, strategy=strat, host=args.host, port=args.port, client_id=args.client_id)
