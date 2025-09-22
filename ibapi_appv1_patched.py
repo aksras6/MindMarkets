@@ -31,11 +31,14 @@ from ibapi.order import Order
 import threading
 import sys
 import time
+from pathlib import Path
+import datetime as _dt
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
+from datetime import timezone as _tz
 import os
 from types import SimpleNamespace
 
@@ -158,6 +161,18 @@ def upsert_bars_into_df(df: pd.DataFrame, symbol: str, new_bars: List[BarData]) 
     combined = pd.concat([df, add_df])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     return combined
+
+# ---------- Parquet cache settings ----------
+CACHE_DIR = Path("cache_parquet")     # where .parquet files live
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _safe_sym(sym: str) -> str:
+    # make filename friendly (e.g., BRK.A -> BRK_A)
+    return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in sym)
+
+def _parquet_path(sym: str) -> Path:
+    return CACHE_DIR / f"{_safe_sym(sym)}.parquet"
+
 
 # --- Gateway wrapper for consistent start/stop ---
 class IBGateway:
@@ -923,24 +938,137 @@ def create_bracket_buy(parent_id: int, qty: int, entry_stop: float, stop_loss: f
     child.transmit = True
     return [parent, child]
 
+def _read_cached_daily(sym: str) -> pd.DataFrame:
+    fp = _parquet_path(sym)
+    if not fp.exists():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_parquet(fp)
+
+        # Try to ensure a DatetimeIndex regardless of how it was saved.
+        if isinstance(df.index, pd.DatetimeIndex):
+            idx = df.index
+        else:
+            idx = None
+            # Common patterns we saved earlier:
+            if "date" in df.columns:
+                idx = pd.to_datetime(df["date"], errors="coerce")
+            elif "index" in df.columns:
+                idx = pd.to_datetime(df["index"], errors="coerce")
+
+            if idx is not None:
+                df = df.set_index(idx)
+            else:
+                # Legacy/bad cache: no datetime info; discard cache so we re-fetch cleanly
+                print(f"[CACHE][{sym}] No datetime column in cache; ignoring old cache.")
+                return pd.DataFrame()
+
+        # Drop any NaT rows, sort by time
+        df = df[~df.index.isna()].sort_index()
+
+        # Optional: keep only expected OHLCV columns if you want a clean schema
+        # cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+        # df = df[cols]
+
+        return df
+
+    except Exception as e:
+        print(f"[CACHE][{sym}] read_parquet failed, ignoring cache: {e}")
+        return pd.DataFrame()
+
+def _write_cached_daily(sym: str, df: pd.DataFrame) -> None:
+    fp = _parquet_path(sym)
+    # make sure we persist a stable index (DatetimeIndex)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "date" in df.columns:
+            df = df.set_index(pd.to_datetime(df["date"]))
+        else:
+            raise ValueError("Expected DatetimeIndex or a 'date' column for cache write.")
+    # store index as a column so Parquet is self-contained (optional)
+    out = df.copy()
+    out = out.reset_index().rename(columns={"index": "date"})
+    try:
+        out.to_parquet(fp, index=False)  # requires pyarrow or fastparquet
+    except Exception as e:
+        print(f"[CACHE][{sym}] to_parquet failed: {e}")
+
+def _merge_upsert(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Combine old and new bars, keep the latest instance per timestamp.
+    """
+    if old_df is None or old_df.empty:
+        merged = new_df.copy()
+    elif new_df is None or new_df.empty:
+        merged = old_df.copy()
+    else:
+        merged = pd.concat([old_df, new_df], axis=0)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    return merged
+
+
 def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -> pd.DataFrame:
-    """Fetch latest daily bars for `symbol` and return `strategy.prepare(df)` with indicators."""
+    """Fetch latest daily bars for `symbol` using a Parquet cache and return strategy.prepare(df)."""
+    # 1) Try cache
+    cached = _read_cached_daily(symbol)
+    last_dt = None
+    if not cached.empty:
+        last_dt = cached.index.max()
+
+    # Normalise last_dt into a date, or clear if it isn't time-like.
+    if last_dt is not None:
+        if isinstance(last_dt, pd.Timestamp):
+            last_date = last_dt.date()
+        elif isinstance(last_dt, _dt.datetime):
+            last_date = last_dt.date()
+        elif isinstance(last_dt, _dt.date):
+            last_date = last_dt
+        else:
+            # Bad legacy cache index type (e.g., int). Ignore cache this run.
+            print(f"[CACHE][{symbol}] Non-datetime index in cache (type={type(last_dt)}); refetching full.")
+            last_dt = None
+            last_date = None
+    else:
+        last_date = None
+
+        # Safety: ensure it's end of day (daily bars). If it's tz-naive, that's fine for dailies.
+        # We will fetch any gap from (last_dt + 1 bar) onward.
+
+    # 2) Decide what to download from IB
+    # If nothing cached, fall back to START_DATE; otherwise compute delta days from last cache to "now".
     contract = resolve_contract(app, symbol)
     if contract is None:
         return pd.DataFrame()
 
-    dur = duration_from_startdate(START_DATE)
-    bars = fetch_hist_once(
-        app, symbol, contract, dur, BAR_SIZE, WHAT_TO_SHOW, USE_RTH, end_datetime="", timeout_sec=90
-    )
-    df = upsert_bars_into_df(pd.DataFrame(), symbol, bars)
-    if df.empty:
-        return df
+    # Compute duration for IB "durationStr"
+    # IB accepts things like "30 D" for daily bars. We'll pull a small overlap to be safe.
+    today = _dt.datetime.now(_tz.utc).date()  # IB dates are generally UTC; daily bar end is OK
+    if last_dt is None:
+        dur = duration_from_startdate(START_DATE)
+    else:
+        # use last_date computed above
+        missing_days = max(0, (today - last_date).days) + 3
+        missing_days = min(missing_days, 3650)
+        dur = f"{missing_days} D"
 
-    d = df.dropna(subset=["open","high","low","close"]).copy()
-    # Delegate indicator prep to the strategy
-    d = strategy.prepare(d)
-    return d
+
+    # 3) Fetch from IB
+    bars = fetch_hist_once(
+        app, symbol, contract, dur, BAR_SIZE, WHAT_TO_SHOW, USE_RTH,
+        end_datetime="", timeout_sec=90
+    )
+    df_new = upsert_bars_into_df(pd.DataFrame(), symbol, bars)
+    # ensure we only keep OHLCV columns; your upsert already returns the right schema
+    df_new = df_new.dropna(subset=["open","high","low","close"]).sort_index()
+
+    # 4) Merge with cache and persist
+    merged = _merge_upsert(cached, df_new)
+    if not merged.empty:
+        _write_cached_daily(symbol, merged)
+
+    # 5) Return prepared DF for the strategy
+    return strategy.prepare(merged)
+
 
 
 def place_paper_orders_now(
@@ -1180,6 +1308,199 @@ def roll_daily_brackets_after_close(
         if reader:
             reader.join(timeout=3)
 
+def _console_report(summary: dict) -> None:
+    """Pretty-print the KPI summary in fixed columns for quick scanning."""
+    if not summary:
+        print("[REPORT] No summary to display.")
+        return
+
+    # Order & labels (compact, manager-friendly)
+    order = [
+        ("Strategy", "Strategy"),
+        ("BarsUsed", "Bars"),
+        ("StartEquity", "Start"),
+        ("FinalEquity", "Final"),
+        ("TotalReturnPct", "Total %"),
+        ("CAGR", "CAGR %"),
+        ("MaxDDPct", "MaxDD %"),
+        ("Calmar", "Calmar"),
+        ("Sharpe", "Sharpe"),
+        ("Trades", "#Trades"),
+        ("PctWins", "%Wins"),
+        ("ProfitFactor", "PF"),
+        ("NetProfit", "Net P&L"),
+    ]
+    # Widths
+    name_w = max(len(lbl) for _, lbl in order)
+    val_w  = 14
+
+    print("\n=== Portfolio Summary ===")
+    for key, label in order:
+        val = summary.get(key, "NA")
+        print(f"{label:<{name_w}} : {str(val):>{val_w}}")
+    print("")
+
+def _html_report(outdir: str, summary: dict, equity_df: pd.DataFrame, trades_df: pd.DataFrame, title: str = "Backtest Report") -> str:
+    """
+    Write a single-file HTML report with an interactive equity chart (vanilla JS) and sortable trades table.
+    Returns the report path.
+    """
+    import json, os
+    os.makedirs(outdir, exist_ok=True)
+    html_path = os.path.join(outdir, "report.html")
+
+    # Prepare chart series
+    eq_series = []
+    if equity_df is not None and not equity_df.empty:
+        # Expect columns: date, equity
+        for _, row in equity_df.iterrows():
+            eq_series.append([str(row["date"]), float(row["equity"])])
+
+    # Trades table (limit columns; format numbers)
+    trades_cols = ["symbol", "entry_date", "exit_date", "entry_price", "exit_price", "shares", "pnl", "ret_pct"]
+    td = trades_df[trades_cols].copy() if trades_df is not None and not trades_df.empty else pd.DataFrame(columns=trades_cols)
+
+    # Coerce datetimes to ISO strings so JSON doesn’t see Timestamp objects
+    for c in ("entry_date", "exit_date"):
+        if c in td.columns:
+            td[c] = pd.to_datetime(td[c], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # Round numeric columns
+    for c in ("entry_price", "exit_price", "pnl", "ret_pct"):
+        if c in td.columns:
+            td[c] = pd.to_numeric(td[c], errors="coerce").round(4)
+
+    # Ensure shares is int-like if present
+    if "shares" in td.columns:
+        td["shares"] = pd.to_numeric(td["shares"], errors="coerce").astype("Int64")
+
+    trades_rows = td.to_dict(orient="records")
+
+    # Summary kv
+    summary_rows = [{"metric": k, "value": v} for k, v in summary.items()]
+
+    # Minimal JS + CSS (no external deps)
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:24px;}}
+h1{{margin:0 0 8px 0}} h2{{margin:24px 0 8px}}
+.card{{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,0.04)}}
+.kv{{display:grid;grid-template-columns:220px 1fr;gap:8px 12px}}
+.kv div{{padding:6px 0;border-bottom:1px dashed #eee}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{padding:8px;border-bottom:1px solid #eee;text-align:right}}
+th:first-child,td:first-child{{text-align:left}}
+thead th{{cursor:pointer}}
+.chart{{height:320px}}
+.note{{color:#64748b;font-size:12px}}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<div class="note">Generated at runtime • Self-contained file</div>
+
+<div class="card">
+  <h2>Summary</h2>
+  <div class="kv" id="kv"></div>
+</div>
+
+<div class="card">
+  <h2>Equity Curve</h2>
+  <div id="chart" class="chart"></div>
+</div>
+
+<div class="card">
+  <h2>Trades</h2>
+  <table id="trades">
+    <thead><tr>{"".join(f"<th>{c}</th>" for c in trades_cols)}</tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="note">Click headers to sort.</div>
+</div>
+
+<script>
+// Data
+const summaryRows = {json.dumps(summary_rows, default=str, ensure_ascii=False)};
+const eqSeries = {json.dumps(eq_series, default=str, ensure_ascii=False)};
+const tradesRows = {json.dumps(trades_rows, default=str, ensure_ascii=False)};
+
+
+// Summary grid
+const kv = document.getElementById('kv');
+summaryRows.forEach(function(row) {{
+  const k = document.createElement('div'); k.textContent = row.metric;
+  const v = document.createElement('div'); v.textContent = row.value;
+  kv.appendChild(k); kv.appendChild(v);
+}});
+
+// Tiny line chart (no deps)
+(function() {{
+  const el = document.getElementById('chart');
+  if (!eqSeries.length) {{ el.innerHTML = '<div class="note">No equity data</div>'; return; }}
+  const w = el.clientWidth, h = el.clientHeight, p=20;
+  const xs = eqSeries.map(d => new Date(d[0]).getTime());
+  const ys = eqSeries.map(d => d[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const x = t => p + ( (t-minX)/(maxX-minX||1) ) * (w-2*p);
+  const y = v => h - p - ( (v-minY)/(maxY-minY||1) ) * (h-2*p);
+  const path = xs.map((t,i) => (i? 'L':'M') + x(t) + ' ' + y(ys[i])).join(' ');
+  el.innerHTML = '<svg width="'+w+'" height="'+h+'">' +
+                 '<rect x="0" y="0" width="'+w+'" height="'+h+'" fill="white" stroke="#e5e7eb"/>' +
+                 '<path d="'+path+'" fill="none" stroke="#111827" stroke-width="2"/>' +
+                 '</svg>';
+}})();
+
+// Trades table + sorting
+(function() {{
+  const tbody = document.querySelector('#trades tbody');
+  const cols = {json.dumps(trades_cols)};
+  function render(rows) {{
+    tbody.innerHTML = rows.map(r => '<tr>' + cols.map(c => '<td>' + (r[c] ?? '') + '</td>').join('') + '</tr>').join('');
+  }}
+  render(tradesRows);
+
+  const ths = document.querySelectorAll('#trades thead th');
+  ths.forEach((th, idx) => {{
+    let asc = true;
+    th.addEventListener('click', () => {{
+      const key = cols[idx];
+      const sorted = tradesRows.slice().sort((a,b) => {{
+        const va=a[key], vb=b[key];
+        const na = (typeof va === 'number') ? va : (Date.parse(va)||va);
+        const nb = (typeof vb === 'number') ? vb : (Date.parse(vb)||vb);
+        if (na<nb) return asc ? -1 : 1;
+        if (na>nb) return asc ? 1 : -1;
+        return 0;
+      }});
+      asc = !asc;
+      render(sorted);
+    }});
+  }});
+}})();
+</script>
+</body>
+</html>
+"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return html_path
+
+def _json_report(outdir: str, summary: dict) -> str:
+    import os, json
+    os.makedirs(outdir, exist_ok=True)
+    p = os.path.join(outdir, "summary.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=str)
+    return p
+
+
+
 # =========================== Main ===========================
 
 if __name__ == "__main__":
@@ -1213,7 +1534,21 @@ if __name__ == "__main__":
     parser.add_argument("--preview", action="store_true", help="Preview actions without placing orders (trade/roll)")
     parser.add_argument("--outdir", default="output", help="Backtest output folder")
     parser.add_argument("--price-tol", type=float, default=None, help="Treat stops equal within this absolute amount")
+    parser.add_argument("--cache-dir", default="cache_parquet", help="Directory for Parquet cache")
+    parser.add_argument("--no-cache", action="store_true", help="Disable Parquet caching (always download)")
+    parser.add_argument("--html-report", action="store_true", help="Write a self-contained HTML report")
+    parser.add_argument("--json-report", action="store_true", help="Write a summary.json in the output folder")
+    parser.add_argument("--no-console-report", action="store_true", help="Skip pretty console printing of KPIs")
+
+
+    # after: args = parser.parse_args()
+    
+    
+
     args = parser.parse_args()
+
+    CACHE_DIR = Path(args.cache_dir)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     
     if args.price_tol is not None:
         PRICE_TOL = float(args.price_tol)
@@ -1267,6 +1602,22 @@ if __name__ == "__main__":
         os.makedirs(args.outdir, exist_ok=True)
         save_csvs(args.outdir, trades_df, summary, equity_df)
         print(f"[BACKTEST] Saved CSVs to: {args.outdir}")
+        # Console pretty summary
+        if not args.no_console_report:
+            _console_report(summary)
+
+        # Optional JSON
+        if args.json_report:
+            jp = _json_report(args.outdir, summary)
+            print(f"[BACKTEST] JSON summary: {jp}")
+
+        # Optional HTML (single-file with chart + tables)
+        if args.html_report:
+            hp = _html_report(args.outdir, summary, equity_df, trades_df, title=f"Backtest Report — {strat.name}")
+            print(f"[BACKTEST] HTML report: {hp}")
+
+
+
     elif args.roll:
         if args.force_roll:
             def _ok(): return True
