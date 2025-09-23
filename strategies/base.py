@@ -4,13 +4,16 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import pandas as pd
 
+
 @dataclass
 class PositionSpec:
     """What to place for a new position on the next bar."""
+
     symbol: str
     qty: int
     entry_stop: float
     protective_stop: float
+
 
 class BaseStrategy(ABC):
     """
@@ -33,7 +36,9 @@ class BaseStrategy(ABC):
         ...
 
     @abstractmethod
-    def next_entry_spec(self, symbol: str, df_i: pd.Series) -> Optional[Tuple[float, float]]:
+    def next_entry_spec(
+        self, symbol: str, df_i: pd.Series
+    ) -> Optional[Tuple[float, float]]:
         """Return (entry_stop, protective_stop) for next bar, or None."""
         ...
 

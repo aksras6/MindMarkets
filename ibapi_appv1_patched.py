@@ -1,4 +1,3 @@
-
 """
 ADX Squeeze Breakout (Long) – IBKR data + portfolio backtest + CSV exports + Paper-Trading “dry run”
 
@@ -47,32 +46,69 @@ from types import SimpleNamespace
 from strategies.base import BaseStrategy
 from strategies.adx_squeeze import AdxSqueezeBreakout
 from strategies.rsi_breakout import RsiBreakout
+from strategies.rsi_trigger import RsiTrigger
+from strategies.high_lowatr import HighLowAtrBreakout
+from strategies.three_amigos import ThreeAmigos
+
+
 
 
 # --- Strategy registry for easy selection/extension ---
 STRATEGY_REGISTRY = {
     "adx_squeeze": lambda **kw: AdxSqueezeBreakout(**kw),
-    "rsi_breakout": lambda **kw: RsiBreakout(**kw),   # <-- add this line
+    "rsi_breakout": lambda **kw: RsiBreakout(**kw),  # <-- add this line
+    "rsi_trigger": lambda **kw: RsiTrigger(**kw),
+    "high_lowatr": lambda **kw: HighLowAtrBreakout(**kw),
+    "three_amigos": lambda **kw: ThreeAmigos(**kw),
+
     # "my_new": lambda **kw: MyNewStrategy(**kw),
 }
 
 # Which kwargs each strategy accepts (allow-list)
 STRATEGY_PARAM_KEYS = {
     "adx_squeeze": {
-        "len_channel", "adx_len", "adx_thresh",
-        "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars",
+        "len_channel",
+        "adx_len",
+        "adx_thresh",
+        "trade_pct",
+        "max_positions",
+        "max_exposure_pct",
+        "warmup_bars",
     },
     "rsi_breakout": {
-        "len_channel", "rsi_len", "rsi_thresh",
-        "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars",
+        "len_channel",
+        "rsi_len",
+        "rsi_thresh",
+        "trade_pct",
+        "max_positions",
+        "max_exposure_pct",
+        "warmup_bars",
     },
+    "rsi_trigger": {
+    "rsi_len", "rsi_thresh", "xbars",
+    "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars"
+},
+
+    "high_lowatr": {
+        "bbars",           # lookback for highest/lowest checks
+        "atr_len",         # ATR period (e.g., 14)
+        "maxl",            # max ATR in dollars/contract
+        "big_point_value", # $ per point to convert ATR to dollars
+        "trade_pct",       # position sizing fraction of equity
+        "max_positions",
+        "max_exposure_pct",
+        "warmup_bars",     # recommend max(atr_len, bbars)
+    },
+
 }
 
 
 def build_strategy(name: str, **overrides) -> BaseStrategy:
     key = (name or "adx_squeeze").strip().lower()
     if key not in STRATEGY_REGISTRY:
-        raise ValueError(f"Unknown strategy '{name}'. Known: {', '.join(STRATEGY_REGISTRY)}")
+        raise ValueError(
+            f"Unknown strategy '{name}'. Known: {', '.join(STRATEGY_REGISTRY)}"
+        )
 
     allowed = STRATEGY_PARAM_KEYS.get(key, set())
     clean = {k: v for k, v in overrides.items() if k in allowed and v is not None}
@@ -80,13 +116,13 @@ def build_strategy(name: str, **overrides) -> BaseStrategy:
 
 
 # =========================== Parameters (RealTest parity) ===========================
-LEN = 20                 # channel lookback
+LEN = 20  # channel lookback
 ADXLEN = 15
 ADXTHRESH = 20.0
-TRADE_PCT = 15.0         # % of equity per position
+TRADE_PCT = 15.0  # % of equity per position
 ACCOUNT_SIZE = 10_000.0  # starting equity
 MAX_POSITIONS = 10
-MAX_EXPOSURE_PCT = 100.0 # total gross exposure limit
+MAX_EXPOSURE_PCT = 100.0  # total gross exposure limit
 
 COMMISSION_PER_SH = 0.01
 SLIPPAGE_PER_SH = 0.02
@@ -97,7 +133,7 @@ WHAT_TO_SHOW = "TRADES"
 
 # If you want to mirror StartDate: set START_DATE (YYYY-MM-DD).
 # The downloader converts this into a year-based duration (IB requires years for >365d).
-START_DATE = "2020-01-01"   # or None to use fixed duration below
+START_DATE = "2020-01-01"  # or None to use fixed duration below
 
 # Fallback fixed duration in YEARS (string format like "8 Y") if START_DATE is None
 DURATION_YEARS = "8 Y"
@@ -114,6 +150,7 @@ _SYMBOL_NORMALIZE = {
 # Idempotency tolerances
 PRICE_TOL = 1e-4  # treat stops as equal if within this amount
 
+
 # =========================== DF helpers ===========================
 def _bar_to_dict(bar: BarData) -> dict:
     return {
@@ -127,6 +164,7 @@ def _bar_to_dict(bar: BarData) -> dict:
         "wap": getattr(bar, "average", getattr(bar, "wap", None)),
     }
 
+
 def _parse_ib_date(date_str: str) -> pd.Timestamp:
     if not isinstance(date_str, str):
         return pd.NaT
@@ -135,6 +173,7 @@ def _parse_ib_date(date_str: str) -> pd.Timestamp:
     if len(date_str) == 17:
         return pd.to_datetime(date_str, format="%Y%m%d  %H:%M:%S", errors="coerce")
     return pd.to_datetime(date_str, errors="coerce")
+
 
 def bars_to_dataframe(symbol: str, bars: List[BarData]) -> pd.DataFrame:
     rows = [_bar_to_dict(b) for b in bars]
@@ -152,7 +191,10 @@ def bars_to_dataframe(symbol: str, bars: List[BarData]) -> pd.DataFrame:
         df.insert(0, "symbol", symbol)
     return df
 
-def upsert_bars_into_df(df: pd.DataFrame, symbol: str, new_bars: List[BarData]) -> pd.DataFrame:
+
+def upsert_bars_into_df(
+    df: pd.DataFrame, symbol: str, new_bars: List[BarData]
+) -> pd.DataFrame:
     add_df = bars_to_dataframe(symbol, new_bars)
     if df is None or df.empty:
         return add_df
@@ -162,13 +204,16 @@ def upsert_bars_into_df(df: pd.DataFrame, symbol: str, new_bars: List[BarData]) 
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
     return combined
 
+
 # ---------- Parquet cache settings ----------
-CACHE_DIR = Path("cache_parquet")     # where .parquet files live
+CACHE_DIR = Path("cache_parquet")  # where .parquet files live
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _safe_sym(sym: str) -> str:
     # make filename friendly (e.g., BRK.A -> BRK_A)
     return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in sym)
+
 
 def _parquet_path(sym: str) -> Path:
     return CACHE_DIR / f"{_safe_sym(sym)}.parquet"
@@ -186,7 +231,9 @@ class IBGateway:
     def start(self, wait_sec: int = 10):
         print("[GW] Connecting…")
         self.app.connect(self.host, self.port, clientId=self.client_id)
-        self._reader = threading.Thread(target=self.app.run, name="ibapi-reader", daemon=True)
+        self._reader = threading.Thread(
+            target=self.app.run, name="ibapi-reader", daemon=True
+        )
         self._reader.start()
         if not self.app.connected_evt.wait(timeout=wait_sec):
             raise TimeoutError("Timed out waiting for IB connection (nextValidId).")
@@ -201,7 +248,10 @@ class IBGateway:
             if self._reader:
                 self._reader.join(timeout=5)
                 if self._reader.is_alive():
-                    print("[GW][WARN] Reader thread did not exit cleanly.", file=sys.stderr)
+                    print(
+                        "[GW][WARN] Reader thread did not exit cleanly.",
+                        file=sys.stderr,
+                    )
 
 
 # =========================== IB App ===========================
@@ -229,7 +279,7 @@ class IbApp(EWrapper, EClient):
         self.dfs_by_symbol: Dict[str, pd.DataFrame] = {}
 
         # Open orders tracking (for cancel/replace flows)
-        self._open_orders = []                    # type: List[tuple]
+        self._open_orders = []  # type: List[tuple]
         self._open_orders_done_evt = threading.Event()
 
     # ---- Connection / IDs ----
@@ -275,9 +325,11 @@ class IbApp(EWrapper, EClient):
     def openOrderEnd(self):
         self._open_orders_done_evt.set()
 
+
 # =========================== Contract Resolution ===========================
 def normalize_symbol(sym: str) -> str:
     return _SYMBOL_NORMALIZE.get(sym, sym)
+
 
 def build_base_stock(symbol: str) -> Contract:
     c = Contract()
@@ -287,7 +339,10 @@ def build_base_stock(symbol: str) -> Contract:
     c.exchange = "SMART"
     return c
 
-def resolve_contract(app: IbApp, symbol: str, timeout_sec: int = 10) -> Optional[Contract]:
+
+def resolve_contract(
+    app: IbApp, symbol: str, timeout_sec: int = 10
+) -> Optional[Contract]:
     """
     Resolve a stock contract but DO NOT assign primaryExchange/primaryExch.
     Some ibapi builds lack those slots; assigning will raise AttributeError.
@@ -338,6 +393,7 @@ def resolve_contract(app: IbApp, symbol: str, timeout_sec: int = 10) -> Optional
     print(f"[APP] Resolved {symbol} → conId={resolved.conId}, sym={resolved.symbol}")
     return resolved
 
+
 # ---------- Order-time contract shim (fix for primaryExchange AttributeError) ----------
 def order_contract(src: Contract) -> object:
     """
@@ -356,7 +412,11 @@ def order_contract(src: Contract) -> object:
         lastTradeDateOrContractMonth=getattr(src, "lastTradeDateOrContractMonth", ""),
         strike=getattr(src, "strike", 0.0),
         right=getattr(src, "right", ""),
-        multiplier=float(getattr(src, "multiplier", 0.0)) if getattr(src, "multiplier", None) else 0.0,
+        multiplier=(
+            float(getattr(src, "multiplier", 0.0))
+            if getattr(src, "multiplier", None)
+            else 0.0
+        ),
         exchange=getattr(src, "exchange", "SMART"),
         primaryExchange=getattr(src, "primaryExch", ""),  # map old -> new
         currency=getattr(src, "currency", "USD"),
@@ -369,18 +429,22 @@ def order_contract(src: Contract) -> object:
         deltaNeutralContract=None,
     )
 
+
 # =========================== Duration helpers (years only for >365d) ===========================
 def duration_from_startdate(start_date_str: Optional[str]) -> str:
     if not start_date_str:
         return DURATION_YEARS
     try:
-        start = datetime.strptime(start_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start = datetime.strptime(start_date_str, "%Y-%m-%d").replace(
+            tzinfo=timezone.utc
+        )
         now = datetime.now(timezone.utc)
         days = (now - start).days
         years = max(1, int(np.ceil(days / 365.0)))
         return f"{years} Y"
     except Exception:
         return DURATION_YEARS
+
 
 # =========================== Historical Download (robust) ===========================
 def fetch_hist_once(
@@ -392,7 +456,7 @@ def fetch_hist_once(
     what_to_show: str,
     use_rth: int,
     end_datetime: str,
-    timeout_sec: int = 90
+    timeout_sec: int = 90,
 ) -> List[BarData]:
     app._current_symbol = symbol
     app._hist_done_evt.clear()
@@ -402,7 +466,9 @@ def fetch_hist_once(
     req_id = app.next_req_id()
     app._current_hist_req_id = req_id
 
-    print(f"[APP] [{symbol}] Historical: dur={duration_str}, bar={bar_size}, show={what_to_show}, RTH={use_rth} (req_id={req_id})")
+    print(
+        f"[APP] [{symbol}] Historical: dur={duration_str}, bar={bar_size}, show={what_to_show}, RTH={use_rth} (req_id={req_id})"
+    )
     app.reqHistoricalData(
         reqId=req_id,
         contract=contract,
@@ -413,13 +479,14 @@ def fetch_hist_once(
         useRTH=use_rth,
         formatDate=1,
         keepUpToDate=False,
-        chartOptions=[]
+        chartOptions=[],
     )
 
     if not app._hist_done_evt.wait(timeout=timeout_sec):
         print(f"[APP][WARN] [{symbol}] historicalDataEnd timeout after {timeout_sec}s")
 
     return app.hist_bars_by_symbol.get(symbol, [])
+
 
 def try_download_symbol(app: IbApp, symbol: str) -> pd.DataFrame:
     contract = resolve_contract(app, symbol)
@@ -447,16 +514,19 @@ def try_download_symbol(app: IbApp, symbol: str) -> pd.DataFrame:
                 bar_size=BAR_SIZE,
                 what_to_show=wts,
                 use_rth=rth,
-                end_datetime=""
+                end_datetime="",
             )
             df = upsert_bars_into_df(pd.DataFrame(), symbol, bars)
-            if not df.empty and all(c in df.columns for c in ["open", "high", "low", "close"]):
-                return df[["symbol","open","high","low","close","volume"]].dropna()
+            if not df.empty and all(
+                c in df.columns for c in ["open", "high", "low", "close"]
+            ):
+                return df[["symbol", "open", "high", "low", "close", "volume"]].dropna()
         except Exception as e:
             print(f"[APP][{symbol}][retry] {dur}/{wts}/RTH={rth} failed: {e}")
         time.sleep(0.5)  # gentle pacing
     print(f"[APP][{symbol}] No historical data after retries — skipping.")
     return pd.DataFrame()
+
 
 # =========================== Indicators (Wilder) ===========================
 def wilder_rma(values: pd.Series, n: int) -> pd.Series:
@@ -467,13 +537,16 @@ def wilder_rma(values: pd.Series, n: int) -> pd.Series:
     if len(arr) < n:
         return pd.Series(out, index=values.index)
     init = np.nanmean(arr[:n])
-    out[n-1] = init
+    out[n - 1] = init
     for i in range(n, len(arr)):
-        out[i] = (out[i-1]*(n-1) + arr[i]) / n
+        out[i] = (out[i - 1] * (n - 1) + arr[i]) / n
     return pd.Series(out, index=values.index)
 
+
 def adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
-    h = df_hlc["high"]; l = df_hlc["low"]; c = df_hlc["close"]
+    h = df_hlc["high"]
+    l = df_hlc["low"]
+    c = df_hlc["close"]
     up_move = h.diff()
     down_move = -l.diff()
 
@@ -481,11 +554,9 @@ def adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     prev_close = c.shift(1)
-    tr = pd.concat([
-        (h - l).abs(),
-        (h - prev_close).abs(),
-        (l - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1
+    ).max(axis=1)
 
     atr = wilder_rma(tr, period)
     plus_di = 100.0 * (wilder_rma(pd.Series(plus_dm, index=c.index), period) / atr)
@@ -495,6 +566,7 @@ def adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
     adx = wilder_rma(dx, period)
     return adx
 
+
 # =========================== Backtest structures ===========================
 @dataclass
 class Position:
@@ -503,6 +575,7 @@ class Position:
     entry_price: float
     entry_idx: int  # bar index in df
     equity_at_entry: float
+
 
 @dataclass
 class Trade:
@@ -515,8 +588,11 @@ class Trade:
     pnl: float
     ret_pct: float
 
+
 # =========================== Execution price models ===========================
-def stop_entry_fill_price(next_bar_open: float, next_bar_high: float, stop_price: float) -> Optional[float]:
+def stop_entry_fill_price(
+    next_bar_open: float, next_bar_high: float, stop_price: float
+) -> Optional[float]:
     if np.isnan(next_bar_open) or np.isnan(next_bar_high) or np.isnan(stop_price):
         return None
     if next_bar_high >= stop_price:
@@ -524,13 +600,17 @@ def stop_entry_fill_price(next_bar_open: float, next_bar_high: float, stop_price
         return raw + SLIPPAGE_PER_SH
     return None
 
-def stop_exit_fill_price(next_bar_open: float, next_bar_low: float, stop_price: float) -> Optional[float]:
+
+def stop_exit_fill_price(
+    next_bar_open: float, next_bar_low: float, stop_price: float
+) -> Optional[float]:
     if np.isnan(next_bar_open) or np.isnan(next_bar_low) or np.isnan(stop_price):
         return None
     if next_bar_low <= stop_price:
         raw = min(stop_price, next_bar_open)
         return raw - SLIPPAGE_PER_SH
     return None
+
 
 # =========================== Idempotent Order Utilities ===========================
 def _fetch_open_orders(app: IbApp) -> List[tuple]:
@@ -541,7 +621,10 @@ def _fetch_open_orders(app: IbApp) -> List[tuple]:
     app._open_orders_done_evt.wait(timeout=10)
     return list(app._open_orders)
 
-def _parents_by_symbol(open_orders: List[tuple]) -> Dict[str, List[Tuple[int, object, object]]]:
+
+def _parents_by_symbol(
+    open_orders: List[tuple],
+) -> Dict[str, List[Tuple[int, object, object]]]:
     """
     Index BUY stop parents (no parentId or parentId==0) by contract.symbol.
     Returns: { "AAPL": [(orderId, contract, order), ...], ... }
@@ -551,13 +634,19 @@ def _parents_by_symbol(open_orders: List[tuple]) -> Dict[str, List[Tuple[int, ob
         sym = getattr(c, "symbol", "")
         if not sym:
             continue
-        if getattr(o, "orderType", "") == "STP" and getattr(o, "action", "").upper() == "BUY":
+        if (
+            getattr(o, "orderType", "") == "STP"
+            and getattr(o, "action", "").upper() == "BUY"
+        ):
             pid = getattr(o, "parentId", 0) or 0
             if pid == 0:
                 out.setdefault(sym, []).append((oid, c, o))
     return out
 
-def _cancel_bracket_by_parent(app: IbApp, parent_id: int, open_orders: List[tuple]) -> None:
+
+def _cancel_bracket_by_parent(
+    app: IbApp, parent_id: int, open_orders: List[tuple]
+) -> None:
     """Cancel parent and any children that reference it via parentId."""
     to_cancel = {oid for oid, _, _ in open_orders if oid == parent_id}
     for oid, _, o in open_orders:
@@ -569,6 +658,7 @@ def _cancel_bracket_by_parent(app: IbApp, parent_id: int, open_orders: List[tupl
             app.cancelOrder(oid)
         except Exception as e:
             print(f"[ORD] cancelOrder({oid}) error: {e}")
+
 
 # =========================== Backtester ===========================
 def backtest_portfolio(
@@ -635,21 +725,23 @@ def backtest_portfolio(
             if stop_loss is None or pd.isna(stop_loss):
                 continue
             nb_open = d["open"].iloc[next_i]
-            nb_low  = d["low"].iloc[next_i]
+            nb_low = d["low"].iloc[next_i]
             exit_fill = stop_exit_fill_price(nb_open, nb_low, stop_loss)
             if exit_fill is not None:
                 comm = pos.shares * COMMISSION_PER_SH
                 pnl = (exit_fill - pos.entry_price) * pos.shares - comm
-                trades.append(Trade(
-                    symbol=sym,
-                    entry_date=all_index[pos.entry_idx],
-                    exit_date=all_index[next_i],
-                    entry_price=pos.entry_price,
-                    exit_price=exit_fill,
-                    shares=pos.shares,
-                    pnl=pnl,
-                    ret_pct=(exit_fill / pos.entry_price - 1.0) * 100.0
-                ))
+                trades.append(
+                    Trade(
+                        symbol=sym,
+                        entry_date=all_index[pos.entry_idx],
+                        exit_date=all_index[next_i],
+                        entry_price=pos.entry_price,
+                        exit_price=exit_fill,
+                        shares=pos.shares,
+                        pnl=pnl,
+                        ret_pct=(exit_fill / pos.entry_price - 1.0) * 100.0,
+                    )
+                )
                 cash += pos.shares * exit_fill - comm
                 to_close.append(sym)
         for sym in to_close:
@@ -688,7 +780,12 @@ def backtest_portfolio(
             for sym, shares, entry_fill, comm in entry_candidates:
                 if len(positions) >= strategy.max_positions:
                     break
-                gross_after = sum(dfs[s]["close"].iloc[i] * positions[s].shares for s in positions) + shares * entry_fill
+                gross_after = (
+                    sum(
+                        dfs[s]["close"].iloc[i] * positions[s].shares for s in positions
+                    )
+                    + shares * entry_fill
+                )
                 exposure_pct = 100.0 * gross_after / max(equity, 1e-9)
                 if exposure_pct > strategy.max_exposure_pct + 1e-9:
                     continue
@@ -698,10 +795,12 @@ def backtest_portfolio(
                     shares=shares,
                     entry_price=entry_fill,
                     entry_idx=next_i,
-                    equity_at_entry=equity
+                    equity_at_entry=equity,
                 )
 
-        close_mv = sum(dfs[s]["close"].iloc[next_i] * positions[s].shares for s in positions)
+        close_mv = sum(
+            dfs[s]["close"].iloc[next_i] * positions[s].shares for s in positions
+        )
         equity = cash + close_mv
         equity_curve[next_i] = equity
 
@@ -710,29 +809,32 @@ def backtest_portfolio(
         px = dfs[sym]["close"].iloc[final_i]
         comm = pos.shares * COMMISSION_PER_SH
         pnl = (px - pos.entry_price) * pos.shares - comm
-        trades.append(Trade(
-            symbol=sym,
-            entry_date=all_index[pos.entry_idx],
-            exit_date=all_index[final_i],
-            entry_price=pos.entry_price,
-            exit_price=px,
-            shares=pos.shares,
-            pnl=pnl,
-            ret_pct=(px / pos.entry_price - 1.0) * 100.0
-        ))
+        trades.append(
+            Trade(
+                symbol=sym,
+                entry_date=all_index[pos.entry_idx],
+                exit_date=all_index[final_i],
+                entry_price=pos.entry_price,
+                exit_price=px,
+                shares=pos.shares,
+                pnl=pnl,
+                ret_pct=(px / pos.entry_price - 1.0) * 100.0,
+            )
+        )
         cash += pos.shares * px - comm
         positions.pop(sym, None)
     equity = cash
     equity_curve[final_i] = equity
 
-        # Equity & returns (use post-warmup segment to avoid flat early curve)
-    eq = pd.Series(equity_curve, index=all_index).replace(0.0, np.nan).ffill().fillna(ACCOUNT_SIZE)
-    eq_eff = eq.iloc[start_idx:]  # effective equity segment (after warmup)
-    returns = (
-        eq_eff.pct_change()
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
+    # Equity & returns (use post-warmup segment to avoid flat early curve)
+    eq = (
+        pd.Series(equity_curve, index=all_index)
+        .replace(0.0, np.nan)
+        .ffill()
+        .fillna(ACCOUNT_SIZE)
     )
+    eq_eff = eq.iloc[start_idx:]  # effective equity segment (after warmup)
+    returns = eq_eff.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
 
     periods = len(eq_eff)  # bars considered (post-warmup)
     start_equity_eff = float(eq_eff.iloc[0])
@@ -750,9 +852,21 @@ def backtest_portfolio(
     dd = (eq_eff - running_max) / running_max
     max_dd_pct = float(abs(dd.min()) * 100.0)
 
-
-    trades_df = pd.DataFrame([t.__dict__ for t in trades]) if trades else pd.DataFrame(
-        columns=["symbol","entry_date","exit_date","entry_price","exit_price","shares","pnl","ret_pct"]
+    trades_df = (
+        pd.DataFrame([t.__dict__ for t in trades])
+        if trades
+        else pd.DataFrame(
+            columns=[
+                "symbol",
+                "entry_date",
+                "exit_date",
+                "entry_price",
+                "exit_price",
+                "shares",
+                "pnl",
+                "ret_pct",
+            ]
+        )
     )
 
     n_trades = len(trades_df)
@@ -764,80 +878,117 @@ def backtest_portfolio(
 
     ret_std = returns.std(ddof=1)
     ret_mean = returns.mean()
-    sharpe = (np.sqrt(252.0) * ret_mean / ret_std) if (ret_std is not None and ret_std > 0) else np.nan
+    sharpe = (
+        (np.sqrt(252.0) * ret_mean / ret_std)
+        if (ret_std is not None and ret_std > 0)
+        else np.nan
+    )
 
     # Annualised volatility (optional)
-    ann_vol_pct = float(returns.std(ddof=1) * np.sqrt(252.0) * 100.0) if returns.shape[0] > 2 else np.nan
+    ann_vol_pct = (
+        float(returns.std(ddof=1) * np.sqrt(252.0) * 100.0)
+        if returns.shape[0] > 2
+        else np.nan
+    )
 
     summary = {
         "Strategy": strategy.name,
-        "BarsUsed": periods,                      # post-warmup bars
+        "BarsUsed": periods,  # post-warmup bars
         "StartEquity": round(float(start_equity_eff), 2),
         "FinalEquity": round(float(final_equity), 2),
-
         # Returns
         "TotalReturnPct": round(float(total_return_pct), 2),
         "CAGR": round(float(cagr_pct), 2),
-        "ROR": round(float(total_return_pct), 2),  # backward-compat alias for TotalReturnPct
-
+        "ROR": round(
+            float(total_return_pct), 2
+        ),  # backward-compat alias for TotalReturnPct
         # Risk
         "MaxDDPct": round(float(max_dd_pct), 2),
         "Calmar": (
-            round(float((cagr_pct / max_dd_pct)) , 3)
-            if (max_dd_pct > 0 and np.isfinite(cagr_pct)) else "NA"
+            round(float((cagr_pct / max_dd_pct)), 3)
+            if (max_dd_pct > 0 and np.isfinite(cagr_pct))
+            else "NA"
         ),
         "Sharpe": round(float(sharpe), 3) if pd.notna(sharpe) else "NA",
-
         # Trading stats
         "Trades": int(n_trades),
         "PctWins": round(float(pct_wins), 2),
-        "ProfitFactor": round(float(profit_factor), 2) if np.isfinite(profit_factor) else "Inf",
-
+        "ProfitFactor": (
+            round(float(profit_factor), 2) if np.isfinite(profit_factor) else "Inf"
+        ),
         # Original fields retained
         "NetProfit": round(float(net_profit), 2),
-
         "AnnVolPct": round(ann_vol_pct, 2) if pd.notna(ann_vol_pct) else "NA",
-
     }
-
 
     equity_df = pd.DataFrame({"date": all_index, "equity": eq.values})
 
     return trades_df, summary, equity_df
 
+
 # =========================== Per-symbol KPI breakdown ===========================
 # =========================== Per-symbol KPI breakdown ===========================
 def kpis_by_symbol(trades_df: pd.DataFrame) -> pd.DataFrame:
     if trades_df.empty:
-        cols = ["symbol","Trades","NetProfit","PctWins","ProfitFactor","AvgRetPct","MedianRetPct"]
+        cols = [
+            "symbol",
+            "Trades",
+            "NetProfit",
+            "PctWins",
+            "ProfitFactor",
+            "AvgRetPct",
+            "MedianRetPct",
+        ]
         return pd.DataFrame(columns=cols)
 
     gp = trades_df.groupby("symbol", dropna=False)
 
     kpis = gp.agg(
-        Trades=("pnl","count"),
-        NetProfit=("pnl","sum"),
-        Wins=("pnl", lambda s: (s > 0).sum() ),
+        Trades=("pnl", "count"),
+        NetProfit=("pnl", "sum"),
+        Wins=("pnl", lambda s: (s > 0).sum()),
         GrossProfit=("pnl", lambda s: s[s > 0].sum()),
         GrossLoss=("pnl", lambda s: -s[s < 0].sum()),
-        AvgRetPct=("ret_pct","mean"),
-        MedianRetPct=("ret_pct","median"),
+        AvgRetPct=("ret_pct", "mean"),
+        MedianRetPct=("ret_pct", "median"),
     ).reset_index()
 
-    kpis["PctWins"] = np.where(kpis["Trades"] > 0, 100.0 * kpis["Wins"] / kpis["Trades"], 0.0)
-    kpis["ProfitFactor"] = np.where(kpis["GrossLoss"] > 0, kpis["GrossProfit"] / kpis["GrossLoss"], np.inf)
+    kpis["PctWins"] = np.where(
+        kpis["Trades"] > 0, 100.0 * kpis["Wins"] / kpis["Trades"], 0.0
+    )
+    kpis["ProfitFactor"] = np.where(
+        kpis["GrossLoss"] > 0, kpis["GrossProfit"] / kpis["GrossLoss"], np.inf
+    )
 
-    kpis = kpis.drop(columns=["Wins","GrossProfit","GrossLoss"])
+    kpis = kpis.drop(columns=["Wins", "GrossProfit", "GrossLoss"])
     kpis["NetProfit"] = kpis["NetProfit"].round(2)
     kpis["PctWins"] = kpis["PctWins"].round(2)
-    kpis["ProfitFactor"] = kpis["ProfitFactor"].replace(np.inf, np.nan).round(2).fillna("Inf")
+    kpis["ProfitFactor"] = (
+        kpis["ProfitFactor"].replace(np.inf, np.nan).round(2).fillna("Inf")
+    )
     kpis["AvgRetPct"] = kpis["AvgRetPct"].round(3)
     kpis["MedianRetPct"] = kpis["MedianRetPct"].round(3)
 
-    return kpis[["symbol","Trades","NetProfit","PctWins","ProfitFactor","AvgRetPct","MedianRetPct"]]
+    return kpis[
+        [
+            "symbol",
+            "Trades",
+            "NetProfit",
+            "PctWins",
+            "ProfitFactor",
+            "AvgRetPct",
+            "MedianRetPct",
+        ]
+    ]
+
 
 # =========================== Save CSV helpers ===========================
-def save_csvs(output_dir: str, trades_df: pd.DataFrame, summary: Dict[str, any], equity_df: pd.DataFrame):
+def save_csvs(
+    output_dir: str,
+    trades_df: pd.DataFrame,
+    summary: Dict[str, any],
+    equity_df: pd.DataFrame,
+):
     os.makedirs(output_dir, exist_ok=True)
 
     trades_path = os.path.join(output_dir, "adx_trades.csv")
@@ -860,13 +1011,14 @@ def save_csvs(output_dir: str, trades_df: pd.DataFrame, summary: Dict[str, any],
     print(f" - KPIs by sym:   {sym_kpis_path}")
     print(f" - KPIs portfolio:{port_kpis_path}")
 
+
 # =========================== Orchestration (Historical Backtest) ===========================
 def run_download_and_backtest(
     symbols: List[str],
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 17,
-    output_dir: str = "output"
+    output_dir: str = "output",
 ):
     app = IbApp()
     reader = None
@@ -888,7 +1040,9 @@ def run_download_and_backtest(
             usable[sym] = df
 
         if not usable:
-            print("[APP] No symbols produced data. Check permissions/contracts and try again.")
+            print(
+                "[APP] No symbols produced data. Check permissions/contracts and try again."
+            )
             return pd.DataFrame(), {}
 
         print("[BT] Running backtest…")
@@ -914,10 +1068,15 @@ def run_download_and_backtest(
         if reader:
             reader.join(timeout=5)
             if reader.is_alive():
-                print("[APP][WARN] Reader thread did not exit cleanly.", file=sys.stderr)
+                print(
+                    "[APP][WARN] Reader thread did not exit cleanly.", file=sys.stderr
+                )
+
 
 # =========================== Paper-Trading “Dry Run Now” (Idempotent) ===========================
-def create_stop_order(action: str, total_qty: int, stop_price: float, tif: str="GTC") -> Order:
+def create_stop_order(
+    action: str, total_qty: int, stop_price: float, tif: str = "GTC"
+) -> Order:
     o = Order()
     o.action = action.upper()
     o.orderType = "STP"
@@ -927,7 +1086,10 @@ def create_stop_order(action: str, total_qty: int, stop_price: float, tif: str="
     o.transmit = True
     return o
 
-def create_bracket_buy(parent_id: int, qty: int, entry_stop: float, stop_loss: float, tif: str="GTC"):
+
+def create_bracket_buy(
+    parent_id: int, qty: int, entry_stop: float, stop_loss: float, tif: str = "GTC"
+):
     parent = create_stop_order("BUY", qty, entry_stop, tif)
     parent.orderId = parent_id
     parent.transmit = False
@@ -937,6 +1099,7 @@ def create_bracket_buy(parent_id: int, qty: int, entry_stop: float, stop_loss: f
     child.orderId = parent_id + 1
     child.transmit = True
     return [parent, child]
+
 
 def _read_cached_daily(sym: str) -> pd.DataFrame:
     fp = _parquet_path(sym)
@@ -961,7 +1124,9 @@ def _read_cached_daily(sym: str) -> pd.DataFrame:
                 df = df.set_index(idx)
             else:
                 # Legacy/bad cache: no datetime info; discard cache so we re-fetch cleanly
-                print(f"[CACHE][{sym}] No datetime column in cache; ignoring old cache.")
+                print(
+                    f"[CACHE][{sym}] No datetime column in cache; ignoring old cache."
+                )
                 return pd.DataFrame()
 
         # Drop any NaT rows, sort by time
@@ -977,6 +1142,7 @@ def _read_cached_daily(sym: str) -> pd.DataFrame:
         print(f"[CACHE][{sym}] read_parquet failed, ignoring cache: {e}")
         return pd.DataFrame()
 
+
 def _write_cached_daily(sym: str, df: pd.DataFrame) -> None:
     fp = _parquet_path(sym)
     # make sure we persist a stable index (DatetimeIndex)
@@ -984,7 +1150,9 @@ def _write_cached_daily(sym: str, df: pd.DataFrame) -> None:
         if "date" in df.columns:
             df = df.set_index(pd.to_datetime(df["date"]))
         else:
-            raise ValueError("Expected DatetimeIndex or a 'date' column for cache write.")
+            raise ValueError(
+                "Expected DatetimeIndex or a 'date' column for cache write."
+            )
     # store index as a column so Parquet is self-contained (optional)
     out = df.copy()
     out = out.reset_index().rename(columns={"index": "date"})
@@ -992,6 +1160,7 @@ def _write_cached_daily(sym: str, df: pd.DataFrame) -> None:
         out.to_parquet(fp, index=False)  # requires pyarrow or fastparquet
     except Exception as e:
         print(f"[CACHE][{sym}] to_parquet failed: {e}")
+
 
 def _merge_upsert(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1007,7 +1176,9 @@ def _merge_upsert(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -> pd.DataFrame:
+def latest_completed_daily_df(
+    app: IbApp, symbol: str, strategy: BaseStrategy
+) -> pd.DataFrame:
     """Fetch latest daily bars for `symbol` using a Parquet cache and return strategy.prepare(df)."""
     # 1) Try cache
     cached = _read_cached_daily(symbol)
@@ -1025,7 +1196,9 @@ def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -
             last_date = last_dt
         else:
             # Bad legacy cache index type (e.g., int). Ignore cache this run.
-            print(f"[CACHE][{symbol}] Non-datetime index in cache (type={type(last_dt)}); refetching full.")
+            print(
+                f"[CACHE][{symbol}] Non-datetime index in cache (type={type(last_dt)}); refetching full."
+            )
             last_dt = None
             last_date = None
     else:
@@ -1042,7 +1215,9 @@ def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -
 
     # Compute duration for IB "durationStr"
     # IB accepts things like "30 D" for daily bars. We'll pull a small overlap to be safe.
-    today = _dt.datetime.now(_tz.utc).date()  # IB dates are generally UTC; daily bar end is OK
+    today = _dt.datetime.now(
+        _tz.utc
+    ).date()  # IB dates are generally UTC; daily bar end is OK
     if last_dt is None:
         dur = duration_from_startdate(START_DATE)
     else:
@@ -1051,15 +1226,21 @@ def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -
         missing_days = min(missing_days, 3650)
         dur = f"{missing_days} D"
 
-
     # 3) Fetch from IB
     bars = fetch_hist_once(
-        app, symbol, contract, dur, BAR_SIZE, WHAT_TO_SHOW, USE_RTH,
-        end_datetime="", timeout_sec=90
+        app,
+        symbol,
+        contract,
+        dur,
+        BAR_SIZE,
+        WHAT_TO_SHOW,
+        USE_RTH,
+        end_datetime="",
+        timeout_sec=90,
     )
     df_new = upsert_bars_into_df(pd.DataFrame(), symbol, bars)
     # ensure we only keep OHLCV columns; your upsert already returns the right schema
-    df_new = df_new.dropna(subset=["open","high","low","close"]).sort_index()
+    df_new = df_new.dropna(subset=["open", "high", "low", "close"]).sort_index()
 
     # 4) Merge with cache and persist
     merged = _merge_upsert(cached, df_new)
@@ -1070,16 +1251,14 @@ def latest_completed_daily_df(app: IbApp, symbol: str, strategy: BaseStrategy) -
     return strategy.prepare(merged)
 
 
-
 def place_paper_orders_now(
     symbols: List[str],
     strategy: BaseStrategy,
-    host: str="127.0.0.1",
-    port: int=7497,         # 7497 = PAPER (7496 = LIVE)
-    client_id: int=44,
-    equity: float=ACCOUNT_SIZE
+    host: str = "127.0.0.1",
+    port: int = 7497,  # 7497 = PAPER (7496 = LIVE)
+    client_id: int = 44,
+    equity: float = ACCOUNT_SIZE,
 ):
-
     """
     Idempotent: checks existing open parent BUY STP brackets and skips if identical,
     otherwise cancels/replaces the whole bracket.
@@ -1115,13 +1294,14 @@ def place_paper_orders_now(
                 continue
 
             last = d.iloc[-1]
-            hh = float(last.get("HH", float('nan'))); ll = float(last.get("LL", float('nan')))
+            hh = float(last.get("HH", float("nan")))
+            ll = float(last.get("LL", float("nan")))
 
             if any(pd.isna(x) for x in (hh, ll)):
                 print(f"[DRY][{sym}] indicators NaN; skipping")
                 continue
             if not strategy.is_eligible(last):
-                #print(f"[DRY][{sym}] ADX={adx:.1f} ≥ {ADXTHRESH}; not eligible")
+                # print(f"[DRY][{sym}] ADX={adx:.1f} ≥ {ADXTHRESH}; not eligible")
                 continue
 
             qty = strategy.shares_for_entry(hh, equity)
@@ -1132,18 +1312,24 @@ def place_paper_orders_now(
                 print(f"[DRY][{sym}] qty=0 at stop {hh:.2f}; skipping")
                 continue
 
-            if (gross_target + qty * hh) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
+            if (
+                gross_target + qty * hh
+            ) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
                 print(f"[DRY][{sym}] exposure cap would be exceeded; skipping")
                 continue
 
             # Idempotency check
-            existing_parents = parents_map.get(normalize_symbol(sym), []) or parents_map.get(sym, [])
+            existing_parents = parents_map.get(
+                normalize_symbol(sym), []
+            ) or parents_map.get(sym, [])
             identical_found = False
             for ex_oid, _c, ex_o in existing_parents:
                 ex_qty = int(getattr(ex_o, "totalQuantity", 0))
-                ex_px  = float(getattr(ex_o, "auxPrice", 0.0))
+                ex_px = float(getattr(ex_o, "auxPrice", 0.0))
                 if ex_qty == qty and abs(ex_px - hh) <= PRICE_TOL:
-                    print(f"[DRY][{sym}] matching bracket already exists (qty={qty}, stop={ex_px:.2f}); skipping")
+                    print(
+                        f"[DRY][{sym}] matching bracket already exists (qty={qty}, stop={ex_px:.2f}); skipping"
+                    )
                     identical_found = True
                     break
             if identical_found:
@@ -1164,7 +1350,9 @@ def place_paper_orders_now(
             bracket = create_bracket_buy(oid, qty, hh, ll, tif="GTC")
             next_id += len(bracket)
 
-            print(f"[DRY][{sym}] placing BUY STOP {qty}@{hh:.2f} with protective SELL STOP @{ll:.2f}")
+            print(
+                f"[DRY][{sym}] placing BUY STOP {qty}@{hh:.2f} with protective SELL STOP @{ll:.2f}"
+            )
             for o in bracket:
                 app.placeOrder(o.orderId, contract_for_order, o)
 
@@ -1179,11 +1367,13 @@ def place_paper_orders_now(
         if reader:
             reader.join(timeout=3)
 
+
 # =========================== Daily "roll" after-close (cancel/replace but skip identical) ===========================
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
+
 
 def _after_us_close_now():
     if ZoneInfo is None:
@@ -1198,12 +1388,11 @@ def _after_us_close_now():
 def roll_daily_brackets_after_close(
     symbols: List[str],
     strategy: BaseStrategy,
-    host: str="127.0.0.1",
-    port: int=7497,      # Paper
-    client_id: int=55,
-    equity: float=ACCOUNT_SIZE
+    host: str = "127.0.0.1",
+    port: int = 7497,  # Paper
+    client_id: int = 55,
+    equity: float = ACCOUNT_SIZE,
 ):
-
     """
     After US close:
       - Fetch existing open orders once.
@@ -1245,12 +1434,13 @@ def roll_daily_brackets_after_close(
                 continue
 
             last = d.iloc[-1]
-            hh = float(last.get("HH", float('nan'))); ll = float(last.get("LL", float('nan')))
+            hh = float(last.get("HH", float("nan")))
+            ll = float(last.get("LL", float("nan")))
             if any(pd.isna(x) for x in (hh, ll)):
                 print(f"[ROLL][{sym}] NaN indicator(s); skipping")
                 continue
             if not strategy.is_eligible(last):
-                #print(f"[ROLL][{sym}] not eligible by {strategy.name}")
+                # print(f"[ROLL][{sym}] not eligible by {strategy.name}")
                 continue
 
             qty = strategy.shares_for_entry(hh, equity)
@@ -1261,18 +1451,24 @@ def roll_daily_brackets_after_close(
                 print(f"[ROLL][{sym}] qty=0 at stop {hh:.2f}; skipping")
                 continue
 
-            if (gross_target + qty * hh) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
+            if (
+                gross_target + qty * hh
+            ) / equity * 100.0 > strategy.max_exposure_pct + 1e-9:
                 print(f"[ROLL][{sym}] exposure cap would be exceeded; skipping")
                 continue
 
             # Idempotency: skip identical, else cancel and replace
-            existing_parents = parents_map.get(normalize_symbol(sym), []) or parents_map.get(sym, [])
+            existing_parents = parents_map.get(
+                normalize_symbol(sym), []
+            ) or parents_map.get(sym, [])
             identical_found = False
             for ex_oid, _c, ex_o in existing_parents:
                 ex_qty = int(getattr(ex_o, "totalQuantity", 0))
-                ex_px  = float(getattr(ex_o, "auxPrice", 0.0))
+                ex_px = float(getattr(ex_o, "auxPrice", 0.0))
                 if ex_qty == qty and abs(ex_px - hh) <= PRICE_TOL:
-                    print(f"[ROLL][{sym}] matching bracket already exists (qty={qty}, stop={ex_px:.2f}); skipping")
+                    print(
+                        f"[ROLL][{sym}] matching bracket already exists (qty={qty}, stop={ex_px:.2f}); skipping"
+                    )
                     identical_found = True
                     break
             if identical_found:
@@ -1293,7 +1489,9 @@ def roll_daily_brackets_after_close(
             bracket = create_bracket_buy(parent_id, qty, hh, ll, tif="GTC")
             next_id += len(bracket)
 
-            print(f"[ROLL][{sym}] placing BUY STOP {qty}@{hh:.2f} with protective SELL STOP @{ll:.2f}")
+            print(
+                f"[ROLL][{sym}] placing BUY STOP {qty}@{hh:.2f} with protective SELL STOP @{ll:.2f}"
+            )
             for o in bracket:
                 app.placeOrder(o.orderId, contract_for_order, o)
 
@@ -1307,6 +1505,7 @@ def roll_daily_brackets_after_close(
             app.disconnect()
         if reader:
             reader.join(timeout=3)
+
 
 def _console_report(summary: dict) -> None:
     """Pretty-print the KPI summary in fixed columns for quick scanning."""
@@ -1332,7 +1531,7 @@ def _console_report(summary: dict) -> None:
     ]
     # Widths
     name_w = max(len(lbl) for _, lbl in order)
-    val_w  = 14
+    val_w = 14
 
     print("\n=== Portfolio Summary ===")
     for key, label in order:
@@ -1340,12 +1539,20 @@ def _console_report(summary: dict) -> None:
         print(f"{label:<{name_w}} : {str(val):>{val_w}}")
     print("")
 
-def _html_report(outdir: str, summary: dict, equity_df: pd.DataFrame, trades_df: pd.DataFrame, title: str = "Backtest Report") -> str:
+
+def _html_report(
+    outdir: str,
+    summary: dict,
+    equity_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    title: str = "Backtest Report",
+) -> str:
     """
     Write a single-file HTML report with an interactive equity chart (vanilla JS) and sortable trades table.
     Returns the report path.
     """
     import json, os
+
     os.makedirs(outdir, exist_ok=True)
     html_path = os.path.join(outdir, "report.html")
 
@@ -1357,8 +1564,21 @@ def _html_report(outdir: str, summary: dict, equity_df: pd.DataFrame, trades_df:
             eq_series.append([str(row["date"]), float(row["equity"])])
 
     # Trades table (limit columns; format numbers)
-    trades_cols = ["symbol", "entry_date", "exit_date", "entry_price", "exit_price", "shares", "pnl", "ret_pct"]
-    td = trades_df[trades_cols].copy() if trades_df is not None and not trades_df.empty else pd.DataFrame(columns=trades_cols)
+    trades_cols = [
+        "symbol",
+        "entry_date",
+        "exit_date",
+        "entry_price",
+        "exit_price",
+        "shares",
+        "pnl",
+        "ret_pct",
+    ]
+    td = (
+        trades_df[trades_cols].copy()
+        if trades_df is not None and not trades_df.empty
+        else pd.DataFrame(columns=trades_cols)
+    )
 
     # Coerce datetimes to ISO strings so JSON doesn’t see Timestamp objects
     for c in ("entry_date", "exit_date"):
@@ -1491,8 +1711,10 @@ summaryRows.forEach(function(row) {{
         f.write(html)
     return html_path
 
+
 def _json_report(outdir: str, summary: dict) -> str:
     import os, json
+
     os.makedirs(outdir, exist_ok=True)
     p = os.path.join(outdir, "summary.json")
     with open(p, "w", encoding="utf-8") as f:
@@ -1500,25 +1722,47 @@ def _json_report(outdir: str, summary: dict) -> str:
     return p
 
 
-
 # =========================== Main ===========================
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="IBKR ADX Squeeze — backtest / trade / roll")
+
+    parser = argparse.ArgumentParser(
+        description="IBKR ADX Squeeze — backtest / trade / roll"
+    )
     # Modes
-    parser.add_argument("--trade", action="store_true", help="Place idempotent paper orders for current signals")
-    parser.add_argument("--roll", action="store_true", help="Cancel/replace bracket orders after US close")
-    parser.add_argument("--backtest", action="store_true", help="Run historical backtest (downloads daily bars)")
+    parser.add_argument(
+        "--trade",
+        action="store_true",
+        help="Place idempotent paper orders for current signals",
+    )
+    parser.add_argument(
+        "--roll",
+        action="store_true",
+        help="Cancel/replace bracket orders after US close",
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run historical backtest (downloads daily bars)",
+    )
     # Connection
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7497, help="7497 paper, 7496 live")
     parser.add_argument("--client-id", type=int, default=44)
     # Symbols
-    parser.add_argument("--symbols", nargs="*", help="Space-separated symbols. If omitted, uses the default list.")
-    parser.add_argument("--symbols-file", help="Path to a text file with one symbol per line")
+    parser.add_argument(
+        "--symbols",
+        nargs="*",
+        help="Space-separated symbols. If omitted, uses the default list.",
+    )
+    parser.add_argument(
+        "--symbols-file", help="Path to a text file with one symbol per line"
+    )
     # Strategy selection + overrides
-    parser.add_argument("--strategy", default="adx_squeeze", help="Strategy key (see registry)")
+    parser.add_argument(
+        "--strategy", default="adx_squeeze", help="Strategy key (see registry)"
+    )
     parser.add_argument("--len-channel", type=int, default=None)
     parser.add_argument("--adx-len", type=int, default=None)
     parser.add_argument("--adx-thresh", type=float, default=None)
@@ -1530,26 +1774,50 @@ if __name__ == "__main__":
     parser.add_argument("--rsi-thresh", type=float, default=None)
 
     # Utilities
-    parser.add_argument("--force-roll", action="store_true", help="Run roll even if not after US close")
-    parser.add_argument("--preview", action="store_true", help="Preview actions without placing orders (trade/roll)")
+    parser.add_argument(
+        "--force-roll", action="store_true", help="Run roll even if not after US close"
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Preview actions without placing orders (trade/roll)",
+    )
     parser.add_argument("--outdir", default="output", help="Backtest output folder")
-    parser.add_argument("--price-tol", type=float, default=None, help="Treat stops equal within this absolute amount")
-    parser.add_argument("--cache-dir", default="cache_parquet", help="Directory for Parquet cache")
-    parser.add_argument("--no-cache", action="store_true", help="Disable Parquet caching (always download)")
-    parser.add_argument("--html-report", action="store_true", help="Write a self-contained HTML report")
-    parser.add_argument("--json-report", action="store_true", help="Write a summary.json in the output folder")
-    parser.add_argument("--no-console-report", action="store_true", help="Skip pretty console printing of KPIs")
-
+    parser.add_argument(
+        "--price-tol",
+        type=float,
+        default=None,
+        help="Treat stops equal within this absolute amount",
+    )
+    parser.add_argument(
+        "--cache-dir", default="cache_parquet", help="Directory for Parquet cache"
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable Parquet caching (always download)",
+    )
+    parser.add_argument(
+        "--html-report", action="store_true", help="Write a self-contained HTML report"
+    )
+    parser.add_argument(
+        "--json-report",
+        action="store_true",
+        help="Write a summary.json in the output folder",
+    )
+    parser.add_argument(
+        "--no-console-report",
+        action="store_true",
+        help="Skip pretty console printing of KPIs",
+    )
 
     # after: args = parser.parse_args()
-    
-    
 
     args = parser.parse_args()
 
     CACHE_DIR = Path(args.cache_dir)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     if args.price_tol is not None:
         PRICE_TOL = float(args.price_tol)
     # Symbols (CLI overrides default)
@@ -1559,19 +1827,42 @@ if __name__ == "__main__":
     elif args.symbols:
         symbols = args.symbols
     else:
-        symbols = ["MSFT", "NVDA", "AAPL", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "WMT", "JPM", "V", "SPY", "BRK.A"]
+        symbols = [
+            "MSFT",
+            "NVDA",
+            "AAPL",
+            "AMZN",
+            "GOOGL",
+            "META",
+            "AVGO",
+            "TSLA",
+            "WMT",
+            "JPM",
+            "V",
+            "SPY",
+            "BRK.A",
+        ]
     # Strategy instantiation (CLI overrides fall back to your constants)
     overrides = {}
-    if args.len_channel is not None: overrides["len_channel"] = args.len_channel
-    if args.adx_len is not None: overrides["adx_len"] = args.adx_len
-    if args.adx_thresh is not None: overrides["adx_thresh"] = args.adx_thresh
-    if args.rsi_len is not None: overrides["rsi_len"] = args.rsi_len
-    if args.rsi_thresh is not None: overrides["rsi_thresh"] = args.rsi_thresh
+    if args.len_channel is not None:
+        overrides["len_channel"] = args.len_channel
+    if args.adx_len is not None:
+        overrides["adx_len"] = args.adx_len
+    if args.adx_thresh is not None:
+        overrides["adx_thresh"] = args.adx_thresh
+    if args.rsi_len is not None:
+        overrides["rsi_len"] = args.rsi_len
+    if args.rsi_thresh is not None:
+        overrides["rsi_thresh"] = args.rsi_thresh
 
-    if args.trade_pct is not None: overrides["trade_pct"] = args.trade_pct
-    if args.max_positions is not None: overrides["max_positions"] = args.max_positions
-    if args.max_exposure_pct is not None: overrides["max_exposure_pct"] = args.max_exposure_pct
-    if args.warmup_bars is not None: overrides["warmup_bars"] = args.warmup_bars
+    if args.trade_pct is not None:
+        overrides["trade_pct"] = args.trade_pct
+    if args.max_positions is not None:
+        overrides["max_positions"] = args.max_positions
+    if args.max_exposure_pct is not None:
+        overrides["max_exposure_pct"] = args.max_exposure_pct
+    if args.warmup_bars is not None:
+        overrides["warmup_bars"] = args.warmup_bars
     overrides.setdefault("len_channel", LEN)
     overrides.setdefault("adx_len", ADXLEN)
     overrides.setdefault("adx_thresh", ADXTHRESH)
@@ -1587,6 +1878,7 @@ if __name__ == "__main__":
         try:
             app.connect(args.host, args.port, clientId=args.client_id)
             import threading
+
             reader = threading.Thread(target=app.run, daemon=True)
             reader.start()
             if not app.connected_evt.wait(10):
@@ -1613,21 +1905,40 @@ if __name__ == "__main__":
 
         # Optional HTML (single-file with chart + tables)
         if args.html_report:
-            hp = _html_report(args.outdir, summary, equity_df, trades_df, title=f"Backtest Report — {strat.name}")
+            hp = _html_report(
+                args.outdir,
+                summary,
+                equity_df,
+                trades_df,
+                title=f"Backtest Report — {strat.name}",
+            )
             print(f"[BACKTEST] HTML report: {hp}")
-
-
 
     elif args.roll:
         if args.force_roll:
-            def _ok(): return True
+
+            def _ok():
+                return True
+
             globals()["_after_us_close_now"] = _ok
         if args.preview:
             print("[PREVIEW] Roll would run now (no orders placed).")
         else:
-            roll_daily_brackets_after_close(symbols, strategy=strat, host=args.host, port=args.port, client_id=args.client_id)
+            roll_daily_brackets_after_close(
+                symbols,
+                strategy=strat,
+                host=args.host,
+                port=args.port,
+                client_id=args.client_id,
+            )
     else:
         if args.preview:
             print("[PREVIEW] Would place paper orders now (no orders placed).")
         else:
-            place_paper_orders_now(symbols, strategy=strat, host=args.host, port=args.port, client_id=args.client_id)
+            place_paper_orders_now(
+                symbols,
+                strategy=strat,
+                host=args.host,
+                port=args.port,
+                client_id=args.client_id,
+            )

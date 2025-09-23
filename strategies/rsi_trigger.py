@@ -1,3 +1,4 @@
+# strategies/rsi_trigger.py
 from __future__ import annotations
 from typing import Optional, Tuple
 import numpy as np
@@ -6,13 +7,14 @@ import pandas as pd
 from .base import BaseStrategy
 
 
+# ---- shared-style helpers (mirror rsi_breakout) ----
 def _wilder_rma(values: pd.Series, n: int) -> pd.Series:
     """Wilder-style moving average (RMA)."""
     arr = values.to_numpy(dtype=float)
     out = np.full_like(arr, np.nan, dtype=float)
     if n <= 0 or len(arr) < n:
         return pd.Series(out, index=values.index)
-    # seed with simple mean of first n
+    # Seed with simple mean of first n
     init = np.nanmean(arr[:n])
     out[n - 1] = init
     for i in range(n, len(arr)):
@@ -21,7 +23,7 @@ def _wilder_rma(values: pd.Series, n: int) -> pd.Series:
 
 
 def _rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
-    """Classic RSI (Wilder)."""
+    """Classic RSI (Wilder), 0..100."""
     delta = close.diff()
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
@@ -32,70 +34,92 @@ def _rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-class RsiBreakout(BaseStrategy):
+class RsiTrigger(BaseStrategy):
     """
-    Long-only breakout when momentum is healthy:
-      - Eligibility: RSI(rsi_len) of the last *completed* bar >= rsi_thresh
-      - Entry (next bar): Buy stop at HighestHigh(len_channel)
-      - Protective stop: LowestLow(len_channel)
-      - Sizing: trade_pct of equity
-      - Caps: max_positions, max_exposure_pct
+    RSI Trigger (Kevin J. Davey) — structured to MATCH the RSI Breakout class.
 
-    Defaults favor a mild trend filter (RSI >= 55). Raise to 60-65 to be stricter.
+    Long-only momentum/trigger:
+      Eligibility (on last completed bar):
+        - RSI(rsi_len) < rsi_thresh
+        - Close > SMA(xbars)
+      Entry (next bar):
+        - Market/stop-at-close style: use last close as entry reference
+        - Protective stop: rolling LowestLow(xbars) as a simple stop anchor
+      Sizing: trade_pct of equity
+      Caps: max_positions, max_exposure_pct
+
+    Defaults follow the book’s example idea (rsi_len=5, rsi_thresh=80, xbars=5).
+    Raise rsi_thresh to be more selective (e.g., 70), or lower to be looser.
     """
 
     def __init__(
         self,
         *,
-        len_channel: int = 20,
-        rsi_len: int = 14,
-        rsi_thresh: float = 55.0,
+        rsi_len: int = 5,
+        rsi_thresh: float = 80.0,
+        xbars: int = 5,
         trade_pct: float = 15.0,
         max_positions: int = 10,
         max_exposure_pct: float = 100.0,
         warmup_bars: int | None = None,
     ):
-        self.LEN = int(len_channel)
+        # Parameters (mirroring naming/casing style in RsiBreakout)
         self.RSILEN = int(rsi_len)
         self.RSITHRESH = float(rsi_thresh)
+        self.XBARS = int(xbars)
+
         self.TRADE_PCT = float(trade_pct)
         self._max_positions = int(max_positions)
         self._max_exposure_pct = float(max_exposure_pct)
-        # generous warmup for stable RSI & channels
+
+        # Warmup consistent with Breakout’s approach (ample buffer for stability)
         self._warmup_bars = (
-            max(self.RSILEN * 5, self.LEN + 5)
+            max(self.RSILEN * 5, self.XBARS + 5)
             if warmup_bars is None
             else int(warmup_bars)
         )
 
     @property
     def name(self) -> str:
-        return "RSI Breakout (Long)"
+        return "RSI Trigger (Long)"
 
-    # -------- indicators --------
+    # -------- indicators / prep (match method name & style) --------
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         d = df.dropna(subset=["open", "high", "low", "close"]).copy()
         d["RSI"] = _rsi_wilder(d["close"], self.RSILEN)
-        d["HH"] = d["high"].rolling(self.LEN, min_periods=self.LEN).max()
-        d["LL"] = d["low"].rolling(self.LEN, min_periods=self.LEN).min()
+        d["SMA_X"] = d["close"].rolling(self.XBARS, min_periods=self.XBARS).mean()
+        d["LLX"] = d["low"].rolling(self.XBARS, min_periods=self.XBARS).min()  # stop anchor
         return d
 
-    # -------- logic --------
+    # -------- eligibility (same signature as breakout) --------
     def is_eligible(self, dfi: pd.Series) -> bool:
         rsi = dfi.get("RSI", np.nan)
-        return pd.notna(rsi) and rsi >= self.RSITHRESH
+        sma = dfi.get("SMA_X", np.nan)
+        close = dfi.get("close", np.nan)
+        if not (pd.notna(rsi) and pd.notna(sma) and pd.notna(close)):
+            return False
+        # Davey trigger: RSI below threshold (i.e., not overbought) AND price above short SMA
+        return (rsi < self.RSITHRESH) and (close > sma)
 
+    # -------- entry spec (same return contract as breakout) --------
     def next_entry_spec(
         self, symbol: str, df_i: pd.Series
     ) -> Optional[Tuple[float, float]]:
-        hh = df_i.get("HH", np.nan)
-        ll = df_i.get("LL", np.nan)
-        if pd.isna(hh) or pd.isna(ll) or hh <= 0:
+        """
+        Return (entry_price, protective_stop).
+        We use last close as the reference entry (engine can treat as market/stop-at-close).
+        Stop uses LLX over xbars as a basic protective level.
+        """
+        close = df_i.get("close", np.nan)
+        llx = df_i.get("LLX", np.nan)
+        if pd.isna(close) or close <= 0:
             return None
-        # buy stop at HH, protective stop at LL
-        return float(hh), float(ll)
+        # If LLX isn't ready yet, defer
+        if pd.isna(llx) or llx <= 0:
+            return None
+        return float(close), float(llx)
 
-    # -------- sizing --------
+    # -------- sizing (mirrors breakout) --------
     def dollars_per_trade(self, equity: float) -> float:
         return equity * (self.TRADE_PCT / 100.0)
 
@@ -104,7 +128,7 @@ class RsiBreakout(BaseStrategy):
             return 0
         return int(self.dollars_per_trade(equity) // entry_price)
 
-    # -------- caps & warmup --------
+    # -------- caps & warmup (mirrors breakout) --------
     @property
     def max_positions(self) -> int:
         return self._max_positions

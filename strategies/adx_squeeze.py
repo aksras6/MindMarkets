@@ -5,19 +5,23 @@ import pandas as pd
 
 from .base import BaseStrategy
 
+
 def _wilder_rma(values: pd.Series, n: int) -> pd.Series:
     arr = values.to_numpy(dtype=float)
     out = np.full_like(arr, np.nan, dtype=float)
     if len(arr) == 0 or n <= 0 or len(arr) < n:
         return pd.Series(out, index=values.index)
     init = np.nanmean(arr[:n])
-    out[n-1] = init
+    out[n - 1] = init
     for i in range(n, len(arr)):
-        out[i] = (out[i-1]*(n-1) + arr[i]) / n
+        out[i] = (out[i - 1] * (n - 1) + arr[i]) / n
     return pd.Series(out, index=values.index)
 
+
 def _adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
-    h = df_hlc["high"]; l = df_hlc["low"]; c = df_hlc["close"]
+    h = df_hlc["high"]
+    l = df_hlc["low"]
+    c = df_hlc["close"]
     up_move = h.diff()
     down_move = -l.diff()
 
@@ -25,11 +29,9 @@ def _adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     prev_close = c.shift(1)
-    tr = pd.concat([
-        (h - l).abs(),
-        (h - prev_close).abs(),
-        (l - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1
+    ).max(axis=1)
 
     atr = _wilder_rma(tr, period)
     plus_di = 100.0 * (_wilder_rma(pd.Series(plus_dm, index=c.index), period) / atr)
@@ -38,6 +40,7 @@ def _adx_wilder(df_hlc: pd.DataFrame, period: int = 14) -> pd.Series:
     dx = 100.0 * (plus_di.subtract(minus_di).abs() / (plus_di + minus_di))
     adx = _wilder_rma(dx, period)
     return adx
+
 
 class AdxSqueezeBreakout(BaseStrategy):
     def __init__(
@@ -49,7 +52,7 @@ class AdxSqueezeBreakout(BaseStrategy):
         trade_pct: float = 15.0,
         max_positions: int = 10,
         max_exposure_pct: float = 100.0,
-        warmup_bars: int = None
+        warmup_bars: int = None,
     ):
         self.LEN = int(len_channel)
         self.ADXLEN = int(adx_len)
@@ -57,8 +60,11 @@ class AdxSqueezeBreakout(BaseStrategy):
         self.TRADE_PCT = float(trade_pct)
         self._max_positions = int(max_positions)
         self._max_exposure_pct = float(max_exposure_pct)
-        self._warmup_bars = (max(self.ADXLEN * 5, self.LEN + 5)
-                             if warmup_bars is None else int(warmup_bars))
+        self._warmup_bars = (
+            max(self.ADXLEN * 5, self.LEN + 5)
+            if warmup_bars is None
+            else int(warmup_bars)
+        )
 
     @property
     def name(self) -> str:
@@ -66,7 +72,7 @@ class AdxSqueezeBreakout(BaseStrategy):
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
-        d = d.dropna(subset=["open","high","low","close"])
+        d = d.dropna(subset=["open", "high", "low", "close"])
         d["ADX"] = _adx_wilder(d[["high", "low", "close"]], self.ADXLEN)
         d["HH"] = d["high"].rolling(self.LEN, min_periods=self.LEN).max()
         d["LL"] = d["low"].rolling(self.LEN, min_periods=self.LEN).min()
@@ -74,9 +80,11 @@ class AdxSqueezeBreakout(BaseStrategy):
 
     def is_eligible(self, dfi: pd.Series) -> bool:
         adx = dfi.get("ADX", np.nan)
-        return (pd.notna(adx) and adx < self.ADXTHRESH)
+        return pd.notna(adx) and adx < self.ADXTHRESH
 
-    def next_entry_spec(self, symbol: str, df_i: pd.Series) -> Optional[Tuple[float, float]]:
+    def next_entry_spec(
+        self, symbol: str, df_i: pd.Series
+    ) -> Optional[Tuple[float, float]]:
         hh = df_i.get("HH", np.nan)
         ll = df_i.get("LL", np.nan)
         if pd.isna(hh) or pd.isna(ll) or hh <= 0:
