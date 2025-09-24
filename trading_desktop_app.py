@@ -39,18 +39,22 @@ try:
         roll_daily_brackets_after_close,
         IbApp,
         latest_completed_daily_df,
+        download_with_date_range,
         backtest_portfolio,
         save_csvs,
         _html_report,
         _json_report,
     )
     from strategies.base import BaseStrategy
+    from dateutil.relativedelta import relativedelta
 except ImportError as e:
     logger.error(f"Error importing trading modules: {e}")
     messagebox.showerror(
         "Import Error",
         "Could not import trading modules. Make sure your trading files are in the same directory.",
     )
+    print("Warning: python-dateutil not installed. Walk-forward analysis may not work properly.")
+    print("Install with: pip install python-dateutil")
 
 
 class ConfigManager:
@@ -231,6 +235,308 @@ class OptimizationEngine:
         sorted_results = sorted(self.results, key=sort_key, reverse=True)
         return sorted_results[:top_n]
 
+class WalkForwardEngine:
+    """Walk-forward analysis engine"""
+
+    def __init__(self, app):
+        self.app = app
+        self.results = []
+        self.is_running = False
+        self.stop_requested = False
+
+    def run_walk_forward(
+        self,
+        symbols: List[str],
+        strategy_name: str,
+        param_ranges: dict,
+        data_dict: dict,
+        training_months: int = 12,
+        testing_months: int = 3,
+        reoptimize_months: int = 3,
+        optimization_metric: str = "total_return",
+        min_training_bars: int = 252,
+        callback=None,
+    ):
+        """
+        Run walk-forward analysis
+        
+        Args:
+            symbols: List of symbols to test
+            strategy_name: Strategy to use
+            param_ranges: Parameter ranges for optimization
+            data_dict: Historical data by symbol
+            training_months: Months of training data
+            testing_months: Months of testing data  
+            reoptimize_months: How often to reoptimize (months)
+            optimization_metric: Metric to optimize on
+            min_training_bars: Minimum bars needed for training
+            callback: Progress callback function
+        """
+        self.results = []
+        self.is_running = True
+        self.stop_requested = False
+
+        try:
+            # Get date range from data
+            all_dates = []
+            for df in data_dict.values():
+                if not df.empty:
+                    all_dates.extend(df.index.tolist())
+            
+            if not all_dates:
+                if callback:
+                    callback("No data available for walk-forward analysis", "error")
+                return
+
+            all_dates = sorted(set(all_dates))
+            start_date = min(all_dates)
+            end_date = max(all_dates)
+
+            if callback:
+                callback(f"Walk-forward period: {start_date.date()} to {end_date.date()}", "info")
+
+            # Calculate walk-forward windows
+            windows = self._calculate_wf_windows(
+                start_date, end_date, training_months, testing_months, reoptimize_months
+            )
+
+            if not windows:
+                if callback:
+                    callback("No valid walk-forward windows found", "error")
+                return
+
+            total_windows = len(windows)
+            if callback:
+                callback(f"Generated {total_windows} walk-forward windows", "info")
+
+            # Process each window
+            for i, window in enumerate(windows):
+                if self.stop_requested:
+                    break
+
+                train_start, train_end, test_start, test_end = window
+                
+                if callback:
+                    progress = (i / total_windows) * 100
+                    callback(
+                        f"Window {i+1}/{total_windows}: Training {train_start.date()} to {train_end.date()}, "
+                        f"Testing {test_start.date()} to {test_end.date()} ({progress:.1f}%)",
+                        "progress"
+                    )
+
+                # Split data into training and testing
+                train_data = self._filter_data_by_date(data_dict, train_start, train_end)
+                test_data = self._filter_data_by_date(data_dict, test_start, test_end)
+
+                # Check minimum data requirements
+                train_bars = min(len(df) for df in train_data.values() if not df.empty) if train_data else 0
+                if train_bars < min_training_bars:
+                    if callback:
+                        callback(f"Window {i+1}: Insufficient training data ({train_bars} bars)", "warning")
+                    continue
+
+                # Optimize on training data
+                best_params = self._optimize_on_training_data(
+                    train_data, strategy_name, param_ranges, optimization_metric
+                )
+
+                if not best_params:
+                    if callback:
+                        callback(f"Window {i+1}: Optimization failed", "warning")
+                    continue
+
+                # Test on out-of-sample data
+                test_results = self._test_on_oos_data(
+                    test_data, strategy_name, best_params
+                )
+
+                # Store results
+                window_result = {
+                    "window": i + 1,
+                    "train_start": train_start,
+                    "train_end": train_end,
+                    "test_start": test_start,
+                    "test_end": test_end,
+                    "best_params": best_params,
+                    "oos_results": test_results,
+                    "train_bars": train_bars,
+                    "test_bars": min(len(df) for df in test_data.values() if not df.empty) if test_data else 0,
+                }
+
+                self.results.append(window_result)
+
+            # Calculate aggregate statistics
+            self._calculate_aggregate_stats()
+
+            if callback:
+                callback("Walk-forward analysis completed successfully", "complete")
+
+        except Exception as e:
+            if callback:
+                callback(f"Walk-forward analysis failed: {str(e)}", "error")
+            import traceback
+            print(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+
+    def _calculate_wf_windows(self, start_date, end_date, training_months, testing_months, reoptimize_months):
+        """Calculate walk-forward windows"""
+        from dateutil.relativedelta import relativedelta
+        
+        windows = []
+        current_start = start_date
+        
+        while current_start < end_date:
+            # Training period
+            train_start = current_start
+            train_end = train_start + relativedelta(months=training_months)
+            
+            if train_end >= end_date:
+                break
+                
+            # Testing period
+            test_start = train_end
+            test_end = test_start + relativedelta(months=testing_months)
+            
+            if test_end > end_date:
+                test_end = end_date
+                
+            if test_start < test_end:  # Valid window
+                windows.append((train_start, train_end, test_start, test_end))
+            
+            # Move forward by reoptimize_months
+            current_start += relativedelta(months=reoptimize_months)
+            
+        return windows
+
+    def _filter_data_by_date(self, data_dict, start_date, end_date):
+        """Filter data dictionary by date range"""
+        filtered = {}
+        for symbol, df in data_dict.items():
+            if df.empty:
+                continue
+            mask = (df.index >= start_date) & (df.index <= end_date)
+            filtered_df = df[mask]
+            if not filtered_df.empty:
+                filtered[symbol] = filtered_df
+        return filtered
+
+    def _optimize_on_training_data(self, train_data, strategy_name, param_ranges, metric):
+        """Run optimization on training data"""
+        if not train_data:
+            return None
+            
+        try:
+            # Use the existing optimization engine
+            combinations = self.app.optimizer.generate_parameter_combinations(
+                strategy_name, param_ranges
+            )
+            
+            if not combinations:
+                return None
+
+            best_result = None
+            best_score = float('-inf')
+
+            for params in combinations:
+                try:
+                    strategy = build_strategy(strategy_name, **params)
+                    trades_df, summary, equity_df = backtest_portfolio(train_data, strategy)
+                    
+                    score = summary.get(self._metric_key_mapping().get(metric, metric), 0)
+                    
+                    # Handle special cases
+                    if score == "Inf":
+                        score = float('inf')
+                    elif score == "NA":
+                        score = 0
+                    else:
+                        score = float(score)
+
+                    if score > best_score:
+                        best_score = score
+                        best_result = params.copy()
+
+                except Exception as e:
+                    print(f"Training optimization error for params {params}: {e}")
+                    continue
+
+            return best_result
+
+        except Exception as e:
+            print(f"Training optimization failed: {e}")
+            return None
+
+    def _test_on_oos_data(self, test_data, strategy_name, best_params):
+        """Test optimized parameters on out-of-sample data"""
+        if not test_data or not best_params:
+            return None
+
+        try:
+            strategy = build_strategy(strategy_name, **best_params)
+            trades_df, summary, equity_df = backtest_portfolio(test_data, strategy)
+            return summary
+        except Exception as e:
+            print(f"Out-of-sample testing failed: {e}")
+            return None
+
+    def _calculate_aggregate_stats(self):
+        """Calculate aggregate walk-forward statistics"""
+        if not self.results:
+            return
+
+        # Collect all out-of-sample results
+        oos_returns = []
+        oos_trades = []
+        window_count = 0
+
+        for result in self.results:
+            oos_results = result.get("oos_results")
+            if oos_results:
+                total_return = oos_results.get("TotalReturnPct", 0)
+                trades = oos_results.get("Trades", 0)
+                
+                if isinstance(total_return, (int, float)):
+                    oos_returns.append(total_return)
+                if isinstance(trades, (int, float)):
+                    oos_trades.append(trades)
+                window_count += 1
+
+        if oos_returns:
+            # Calculate aggregate metrics
+            self.aggregate_stats = {
+                "total_windows": len(self.results),
+                "successful_windows": window_count,
+                "avg_oos_return": np.mean(oos_returns),
+                "std_oos_return": np.std(oos_returns),
+                "median_oos_return": np.median(oos_returns),
+                "min_oos_return": min(oos_returns),
+                "max_oos_return": max(oos_returns),
+                "positive_windows": sum(1 for r in oos_returns if r > 0),
+                "negative_windows": sum(1 for r in oos_returns if r < 0),
+                "total_trades": sum(oos_trades),
+                "avg_trades_per_window": np.mean(oos_trades) if oos_trades else 0,
+            }
+        else:
+            self.aggregate_stats = {}
+
+    def _metric_key_mapping(self):
+        """Map optimization metric names to summary keys"""
+        return {
+            "total_return": "TotalReturnPct",
+            "sharpe": "Sharpe", 
+            "profit_factor": "ProfitFactor",
+            "max_dd": "MaxDDPct",
+        }
+
+    def stop_walk_forward(self):
+        """Stop running walk-forward analysis"""
+        self.stop_requested = True
+
+    def get_aggregate_results(self):
+        """Get aggregate walk-forward results"""
+        return getattr(self, 'aggregate_stats', {}), self.results
 
 class TradingApp:
     def __init__(self, root):
@@ -255,6 +561,9 @@ class TradingApp:
 
         # Optimization engine
         self.optimizer = OptimizationEngine(self)
+
+        # Walk-forward engine
+        self.walkforward = WalkForwardEngine(self)
 
         # Apply theme
         self.setup_theme()
@@ -330,6 +639,7 @@ class TradingApp:
         self.create_data_tab()
         self.create_backtest_tab()
         self.create_optimization_tab()
+        self.create_walkforward_tab()
         self.create_trading_tab()
         self.create_portfolio_tab()
         self.create_analytics_tab()
@@ -371,6 +681,7 @@ class TradingApp:
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Run Optimization", command=self.run_optimization)
+        tools_menu.add_command(label="Run Walk-Forward", command=self.start_walk_forward)
         tools_menu.add_command(
             label="Strategy Comparison", command=self.compare_strategies
         )
@@ -420,6 +731,9 @@ class TradingApp:
             side=tk.LEFT, padx=2
         )
         ttk.Button(toolbar, text="🎯 Optimize", command=self.run_optimization).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(toolbar, text="📊 Walk-Forward", command=self.start_walk_forward).pack(  # Add this
             side=tk.LEFT, padx=2
         )
 
@@ -605,6 +919,236 @@ class TradingApp:
         self.symbol_count_label.pack(pady=2)
 
         self.symbols_text.bind("<KeyRelease>", self.update_symbol_count)
+
+
+    def on_wf_strategy_change(self, event=None):
+        """Handle walk-forward strategy change"""
+        self.create_wf_optimization_params()
+
+    def create_wf_optimization_params(self):
+        """Create walk-forward parameter range inputs"""
+        # Clear existing widgets
+        for widget in self.wf_param_ranges_frame.winfo_children():
+            widget.destroy()
+        self.wf_param_range_vars.clear()
+
+        strategy = self.wf_strategy_var.get()
+        if strategy not in STRATEGY_PARAM_KEYS:
+            return
+
+        params = STRATEGY_PARAM_KEYS[strategy]
+
+        # Default ranges for common parameters  
+        default_ranges = {
+            "len_channel": "15,20,25",
+            "adx_len": "10,14,20", 
+            "adx_thresh": "15,20,25,30",
+            "rsi_len": "10,14,20",
+            "rsi_thresh": "50,55,60,65",
+            "trade_pct": "10,15,20",
+            "max_positions": "5,8,10,15",
+        }
+
+        row = 0
+        for param in sorted(params):
+            ttk.Label(
+                self.wf_param_ranges_frame, text=f"{param.replace('_', ' ').title()}:"
+            ).grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+
+            var = tk.StringVar(value=default_ranges.get(param, ""))
+            self.wf_param_range_vars[param] = var
+            entry = ttk.Entry(self.wf_param_ranges_frame, textvariable=var, width=30)
+            entry.grid(row=row, column=1, padx=5, pady=2)
+
+            ttk.Label(self.wf_param_ranges_frame, text="(comma-separated values)").grid(
+                row=row, column=2, sticky=tk.W, padx=5, pady=2
+            )
+
+            row += 1
+
+    def start_walk_forward(self):
+        """Start walk-forward analysis"""
+        if not self.data_cache:
+            messagebox.showwarning("Warning", "No data available. Download data first.")
+            return
+
+        strategy = self.wf_strategy_var.get()
+        if not strategy:
+            messagebox.showwarning("Warning", "Please select a strategy")
+            return
+
+        # Parse parameter ranges
+        param_ranges = {}
+        for param, var in self.wf_param_range_vars.items():
+            range_str = var.get().strip()
+            if range_str:
+                try:
+                    values = [
+                        float(x.strip()) if "." in x.strip() else int(x.strip())
+                        for x in range_str.split(",")
+                    ]
+                    param_ranges[param] = values
+                except ValueError:
+                    messagebox.showerror(
+                        "Error", f"Invalid range for {param}: {range_str}"
+                    )
+                    return
+
+        if not param_ranges:
+            messagebox.showwarning("Warning", "Please specify parameter ranges")
+            return
+
+        # Get time period settings
+        try:
+            training_months = int(self.wf_training_months_var.get())
+            testing_months = int(self.wf_testing_months_var.get())
+            reoptimize_months = int(self.wf_reoptimize_months_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid time period values")
+            return
+
+        self.update_status("Starting walk-forward analysis...")
+        self.wf_progress.config(mode="determinate", maximum=100, value=0)
+
+        def wf_callback(message, msg_type):
+            if msg_type == "progress":
+                if "%" in message:
+                    try:
+                        progress = float(message.split("(")[1].split("%")[0])
+                        self.wf_progress.config(value=progress)
+                    except:
+                        pass
+            self.message_queue.put((f"wf_{msg_type}", message))
+
+        def run_wf():
+            self.walkforward.run_walk_forward(
+                symbols=list(self.data_cache.keys()),
+                strategy_name=strategy,
+                param_ranges=param_ranges,
+                data_dict=self.data_cache,
+                training_months=training_months,
+                testing_months=testing_months, 
+                reoptimize_months=reoptimize_months,
+                optimization_metric=self.wf_metric_var.get(),
+                callback=wf_callback,
+            )
+
+            # Display results
+            aggregate_stats, window_results = self.walkforward.get_aggregate_results()
+            self.message_queue.put(("wf_results", (aggregate_stats, window_results)))
+
+        self.run_in_thread(run_wf)
+
+    def stop_walk_forward(self):
+        """Stop walk-forward analysis"""
+        self.walkforward.stop_walk_forward()
+        self.update_status("Walk-forward analysis stopped")
+
+    def display_wf_results(self, aggregate_stats, window_results):
+        """Display walk-forward results"""
+        # Clear previous results
+        self.wf_results_tree.delete(*self.wf_results_tree.get_children())
+        self.wf_summary_tree.delete(*self.wf_summary_tree.get_children())
+
+        # Display window results
+        for result in window_results:
+            window_num = result.get("window", "")
+            train_period = f"{result['train_start'].strftime('%Y-%m-%d')} to {result['train_end'].strftime('%Y-%m-%d')}"
+            test_period = f"{result['test_start'].strftime('%Y-%m-%d')} to {result['test_end'].strftime('%Y-%m-%d')}"
+            
+            best_params = result.get("best_params", {})
+            params_str = ", ".join([f"{k}={v}" for k, v in best_params.items()])
+            
+            oos_results = result.get("oos_results", {})
+            oos_return = oos_results.get("TotalReturnPct", "N/A")
+            oos_sharpe = oos_results.get("Sharpe", "N/A") 
+            oos_trades = oos_results.get("Trades", "N/A")
+            
+            train_bars = result.get("train_bars", "N/A")
+            test_bars = result.get("test_bars", "N/A")
+
+            self.wf_results_tree.insert(
+                "",
+                "end",
+                text=str(window_num),
+                values=(
+                    train_period,
+                    test_period,
+                    params_str,
+                    f"{oos_return:.2f}" if isinstance(oos_return, (int, float)) else str(oos_return),
+                    f"{oos_sharpe:.3f}" if isinstance(oos_sharpe, (int, float)) else str(oos_sharpe),
+                    str(oos_trades),
+                    str(train_bars),
+                    str(test_bars),
+                ),
+            )
+
+        # Display aggregate statistics
+        for key, value in aggregate_stats.items():
+            self.wf_summary_tree.insert(
+                "", "end", text=key.replace('_', ' ').title(), values=(str(value),)
+            )
+
+    def export_wf_results(self):
+        """Export walk-forward results"""
+        if not hasattr(self.walkforward, 'results') or not self.walkforward.results:
+            messagebox.showwarning("Warning", "No walk-forward results to export")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="Export Walk-Forward Results",
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel files", "*.xlsx"),
+                ("CSV files", "*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if filename:
+            try:
+                # Convert results to DataFrame
+                data = []
+                for result in self.walkforward.results:
+                    row = {
+                        "window": result.get("window"),
+                        "train_start": result.get("train_start"),
+                        "train_end": result.get("train_end"),  
+                        "test_start": result.get("test_start"),
+                        "test_end": result.get("test_end"),
+                        "train_bars": result.get("train_bars"),
+                        "test_bars": result.get("test_bars"),
+                    }
+                    
+                    # Add best parameters
+                    best_params = result.get("best_params", {})
+                    for param, value in best_params.items():
+                        row[f"param_{param}"] = value
+                    
+                    # Add OOS results
+                    oos_results = result.get("oos_results", {})
+                    for metric, value in oos_results.items():
+                        row[f"oos_{metric}"] = value
+                        
+                    data.append(row)
+
+                df = pd.DataFrame(data)
+
+                if filename.endswith(".xlsx"):
+                    with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
+                        df.to_excel(writer, sheet_name="Walk_Forward_Results", index=False)
+                        
+                        # Add aggregate stats sheet
+                        aggregate_stats, _ = self.walkforward.get_aggregate_results()
+                        if aggregate_stats:
+                            agg_df = pd.DataFrame([aggregate_stats])
+                            agg_df.to_excel(writer, sheet_name="Aggregate_Stats", index=False)
+                else:
+                    df.to_csv(filename, index=False)
+
+                messagebox.showinfo("Success", f"Walk-forward results exported to {filename}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Export failed: {e}")
 
     def create_data_tab(self):
         """Data management tab"""
@@ -797,6 +1341,156 @@ class TradingApp:
             side="left", fill="both", expand=True, padx=5, pady=5
         )
         opt_scrollbar.pack(side="right", fill="y")
+
+    def create_walkforward_tab(self):
+        """Walk-forward analysis tab"""
+        self.walkforward_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.walkforward_frame, text="📈 Walk-Forward")
+
+        # Create paned window for walk-forward
+        wf_paned = ttk.PanedWindow(self.walkforward_frame, orient=tk.VERTICAL)
+        wf_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Top frame for controls
+        wf_controls_frame = ttk.Frame(wf_paned)
+        wf_paned.add(wf_controls_frame, weight=1)
+
+        # Walk-forward controls
+        controls_frame = ttk.LabelFrame(wf_controls_frame, text="Walk-Forward Settings")
+        controls_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Strategy and metric selection
+        row1 = ttk.Frame(controls_frame)
+        row1.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(row1, text="Strategy:").pack(side=tk.LEFT, padx=5)
+        self.wf_strategy_var = tk.StringVar()
+        wf_strategy_combo = ttk.Combobox(
+            row1,
+            textvariable=self.wf_strategy_var,
+            values=list(STRATEGY_REGISTRY.keys()),
+            state="readonly",
+            width=15
+        )
+        wf_strategy_combo.pack(side=tk.LEFT, padx=5)
+        wf_strategy_combo.bind("<<ComboboxSelected>>", self.on_wf_strategy_change)
+
+        ttk.Label(row1, text="Optimize for:").pack(side=tk.LEFT, padx=15)
+        self.wf_metric_var = tk.StringVar(value="total_return")
+        wf_metric_combo = ttk.Combobox(
+            row1,
+            textvariable=self.wf_metric_var,
+            values=["total_return", "sharpe", "profit_factor", "max_dd"],
+            state="readonly",
+            width=15
+        )
+        wf_metric_combo.pack(side=tk.LEFT, padx=5)
+
+        # Time period settings
+        row2 = ttk.Frame(controls_frame)
+        row2.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(row2, text="Training (months):").pack(side=tk.LEFT, padx=5)
+        self.wf_training_months_var = tk.StringVar(value="12")
+        ttk.Entry(row2, textvariable=self.wf_training_months_var, width=8).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row2, text="Testing (months):").pack(side=tk.LEFT, padx=15)
+        self.wf_testing_months_var = tk.StringVar(value="3")
+        ttk.Entry(row2, textvariable=self.wf_testing_months_var, width=8).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row2, text="Reoptimize every (months):").pack(side=tk.LEFT, padx=15)
+        self.wf_reoptimize_months_var = tk.StringVar(value="3")
+        ttk.Entry(row2, textvariable=self.wf_reoptimize_months_var, width=8).pack(side=tk.LEFT, padx=5)
+
+        # Parameter ranges frame (reuse from optimization)
+        self.wf_param_ranges_frame = ttk.LabelFrame(wf_controls_frame, text="Parameter Ranges")
+        self.wf_param_ranges_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.wf_param_range_vars = {}
+        
+        # Control buttons
+        button_frame = ttk.Frame(wf_controls_frame)
+        button_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(
+            button_frame,
+            text="🚀 Start Walk-Forward",
+            command=self.start_walk_forward,
+            style="Accent.TButton",
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            button_frame, text="⏹️ Stop Analysis", command=self.stop_walk_forward
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            button_frame, text="📊 Export Results", command=self.export_wf_results
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Progress
+        self.wf_progress = ttk.Progressbar(wf_controls_frame, mode="determinate")
+        self.wf_progress.pack(fill=tk.X, padx=5, pady=5)
+
+        self.wf_progress_label = ttk.Label(wf_controls_frame, text="Ready")
+        self.wf_progress_label.pack(pady=2)
+
+        # Bottom frame for results
+        wf_results_frame = ttk.Frame(wf_paned)
+        wf_paned.add(wf_results_frame, weight=2)
+
+        # Results notebook
+        wf_results_notebook = ttk.Notebook(wf_results_frame)
+        wf_results_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Window results tab
+        window_results_frame = ttk.Frame(wf_results_notebook)
+        wf_results_notebook.add(window_results_frame, text="Window Results")
+
+        self.wf_results_tree = ttk.Treeview(
+            window_results_frame,
+            columns=(
+                "Train_Period", "Test_Period", "Best_Params", "OOS_Return", 
+                "OOS_Sharpe", "OOS_Trades", "Train_Bars", "Test_Bars"
+            ),
+            show="tree headings",
+        )
+        self.wf_results_tree.heading("#0", text="Window")
+        self.wf_results_tree.heading("Train_Period", text="Training Period")
+        self.wf_results_tree.heading("Test_Period", text="Testing Period") 
+        self.wf_results_tree.heading("Best_Params", text="Best Parameters")
+        self.wf_results_tree.heading("OOS_Return", text="OOS Return %")
+        self.wf_results_tree.heading("OOS_Sharpe", text="OOS Sharpe")
+        self.wf_results_tree.heading("OOS_Trades", text="OOS Trades")
+        self.wf_results_tree.heading("Train_Bars", text="Train Bars")
+        self.wf_results_tree.heading("Test_Bars", text="Test Bars")
+
+        # Column widths
+        self.wf_results_tree.column("#0", width=60)
+        self.wf_results_tree.column("Train_Period", width=120)
+        self.wf_results_tree.column("Test_Period", width=120)
+        self.wf_results_tree.column("Best_Params", width=200)
+        self.wf_results_tree.column("OOS_Return", width=100)
+        self.wf_results_tree.column("OOS_Sharpe", width=80)
+        self.wf_results_tree.column("OOS_Trades", width=80)
+        self.wf_results_tree.column("Train_Bars", width=80)
+        self.wf_results_tree.column("Test_Bars", width=80)
+
+        wf_scrollbar = ttk.Scrollbar(
+            window_results_frame, orient="vertical", command=self.wf_results_tree.yview
+        )
+        self.wf_results_tree.configure(yscrollcommand=wf_scrollbar.set)
+
+        self.wf_results_tree.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        wf_scrollbar.pack(side="right", fill="y")
+
+        # Summary tab
+        summary_frame = ttk.Frame(wf_results_notebook)
+        wf_results_notebook.add(summary_frame, text="Summary")
+
+        self.wf_summary_tree = ttk.Treeview(
+            summary_frame, columns=("Value",), show="tree headings"
+        )
+        self.wf_summary_tree.heading("#0", text="Metric")
+        self.wf_summary_tree.heading("Value", text="Value")
+        self.wf_summary_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
     def create_backtest_tab(self):
         """Enhanced backtest tab with real-time results"""
@@ -1053,6 +1747,11 @@ class TradingApp:
             text="📉 Drawdown Analysis",
             command=self.plot_drawdown_analysis,
         ).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(  # Add this button
+            chart_controls,
+            text="🔄 Walk-Forward Analysis",
+            command=self.plot_wf_analysis,
+        ).pack(side=tk.LEFT, padx=5, pady=5)
 
         # Chart area
         self.chart_frame = ttk.Frame(self.analytics_frame)
@@ -1226,13 +1925,23 @@ class TradingApp:
                         )
                     )
 
-                    # Download data using your existing function
-                    df = latest_completed_daily_df(
+                    # **FIX: Pass date range from GUI to download function**
+                    start_date = self.start_date_var.get().strip()
+                    end_date = self.end_date_var.get().strip()
+                    
+                    # Create a temporary strategy just for data download
+                    strategy_params = self.get_strategy_params()
+                    strategy = build_strategy(
+                        self.strategy_var.get(), **strategy_params
+                    )
+                    
+                    # Download data with custom date range
+                    df = download_with_date_range(
                         self.ib_app,
                         symbol,
-                        build_strategy(
-                            self.strategy_var.get(), **self.get_strategy_params()
-                        ),
+                        strategy,
+                        start_date=start_date if start_date else None,
+                        end_date=end_date if end_date else None
                     )
 
                     if not df.empty:
@@ -1844,6 +2553,93 @@ class TradingApp:
 
         plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+
+        fig.tight_layout()
+        self.canvas.draw()
+
+    def plot_wf_analysis(self):
+        """Plot walk-forward analysis results"""
+        if not hasattr(self.walkforward, 'results') or not self.walkforward.results:
+            messagebox.showwarning("Warning", "No walk-forward results available")
+            return
+
+        self.figure.clear()
+        fig = self.figure
+
+        # Extract data for plotting
+        windows = []
+        oos_returns = []
+        train_returns = []
+        
+        for result in self.walkforward.results:
+            windows.append(result.get("window", 0))
+            oos_results = result.get("oos_results", {})
+            oos_return = oos_results.get("TotalReturnPct", 0)
+            
+            if isinstance(oos_return, (int, float)):
+                oos_returns.append(oos_return)
+            else:
+                oos_returns.append(0)
+
+        if not oos_returns:
+            messagebox.showinfo("Info", "No valid walk-forward data to plot")
+            return
+
+        # Plot 1: OOS Returns by Window
+        ax1 = fig.add_subplot(2, 2, 1)
+        bars = ax1.bar(windows, oos_returns, alpha=0.7, 
+                    color=['green' if x > 0 else 'red' for x in oos_returns])
+        ax1.set_title("Out-of-Sample Returns by Window", fontweight="bold")
+        ax1.set_xlabel("Window")
+        ax1.set_ylabel("Return (%)")
+        ax1.grid(True, alpha=0.3)
+        ax1.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+
+        # Plot 2: Cumulative OOS Performance
+        ax2 = fig.add_subplot(2, 2, 2)
+        cumulative_returns = np.cumprod([1 + r/100 for r in oos_returns])
+        ax2.plot(windows, cumulative_returns, 'b-', linewidth=2, marker='o')
+        ax2.set_title("Cumulative Out-of-Sample Performance", fontweight="bold")
+        ax2.set_xlabel("Window")
+        ax2.set_ylabel("Cumulative Return")
+        ax2.grid(True, alpha=0.3)
+
+        # Plot 3: Distribution of OOS Returns
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax3.hist(oos_returns, bins=min(10, len(oos_returns)), alpha=0.7, color="blue", edgecolor="black")
+        ax3.axvline(np.mean(oos_returns), color="red", linestyle="--", 
+                    label=f"Mean: {np.mean(oos_returns):.2f}%")
+        ax3.set_title("Distribution of OOS Returns", fontweight="bold")
+        ax3.set_xlabel("Return (%)")
+        ax3.set_ylabel("Frequency")
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        # Plot 4: Rolling Statistics
+        if len(oos_returns) >= 3:
+            ax4 = fig.add_subplot(2, 2, 4)
+            
+            # Calculate rolling statistics
+            window_size = min(3, len(oos_returns))
+            rolling_mean = pd.Series(oos_returns).rolling(window=window_size).mean()
+            rolling_std = pd.Series(oos_returns).rolling(window=window_size).std()
+            
+            ax4.plot(windows, rolling_mean, 'g-', linewidth=2, label=f'Rolling Mean ({window_size})')
+            ax4.fill_between(windows, 
+                            rolling_mean - rolling_std, 
+                            rolling_mean + rolling_std, 
+                            alpha=0.3, color='green', label='±1 Std Dev')
+            ax4.set_title("Rolling Statistics", fontweight="bold")
+            ax4.set_xlabel("Window")
+            ax4.set_ylabel("Return (%)")
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        else:
+            # Not enough data for rolling stats
+            ax4 = fig.add_subplot(2, 2, 4)
+            ax4.text(0.5, 0.5, 'Insufficient data\nfor rolling statistics', 
+                    ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title("Rolling Statistics", fontweight="bold")
 
         fig.tight_layout()
         self.canvas.draw()
@@ -3134,6 +3930,32 @@ professional-grade tools and reliability.
                     self.progress_label.config(text="Ready")
                     self.opt_progress_label.config(text="Ready")
                     self.update_status("Ready")
+
+                elif msg_type == "wf_progress":
+                    self.wf_progress_label.config(text=msg_data)
+                    self.update_status(msg_data)
+
+                elif msg_type == "wf_info":
+                    self.update_status(msg_data)
+                    self.log_message(msg_data)
+
+                elif msg_type == "wf_warning":
+                    self.log_message(msg_data, "WARNING")
+
+                elif msg_type == "wf_error":
+                    messagebox.showerror("Walk-Forward Error", msg_data)
+                    self.update_status("Walk-forward analysis failed")
+                    self.log_message(msg_data, "ERROR")
+
+                elif msg_type == "wf_complete":
+                    self.wf_progress.config(value=100)
+                    self.wf_progress_label.config(text="Walk-forward analysis complete")
+                    self.update_status("Walk-forward analysis completed")
+                    messagebox.showinfo("Success", msg_data)
+
+                elif msg_type == "wf_results":
+                    aggregate_stats, window_results = msg_data
+                    self.display_wf_results(aggregate_stats, window_results)
 
         except queue.Empty:
             pass

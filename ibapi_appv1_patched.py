@@ -100,6 +100,12 @@ STRATEGY_PARAM_KEYS = {
         "warmup_bars",     # recommend max(atr_len, bbars)
     },
 
+    "three_amigos": {
+    "adx_len", "rsi_len", "lookback_big", "lookback_short",
+    "adx_thresh", "rsi_mid",
+    "trade_pct", "max_positions", "max_exposure_pct", "warmup_bars",
+}
+
 }
 
 
@@ -1249,6 +1255,108 @@ def latest_completed_daily_df(
 
     # 5) Return prepared DF for the strategy
     return strategy.prepare(merged)
+
+def download_with_date_range(
+    app: IbApp, 
+    symbol: str, 
+    strategy: BaseStrategy,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Download data with custom date range from GUI.
+    If start_date is provided, calculate duration from that date.
+    If end_date is provided, use it as the end datetime for IB request.
+    """
+    contract = resolve_contract(app, symbol)
+    if contract is None:
+        return pd.DataFrame()
+
+    # Handle end date
+    if end_date and end_date.strip():
+        try:
+            end_dt = datetime.strptime(end_date.strip(), "%Y-%m-%d")
+            end_datetime = end_dt.strftime("%Y%m%d") + " 23:59:59"
+        except ValueError:
+            print(f"[DOWNLOAD] Invalid end date format: {end_date}. Using current date.")
+            end_datetime = ""
+    else:
+        end_datetime = ""
+
+    # Handle start date and duration
+    if start_date and start_date.strip():
+        try:
+            start_dt = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+            if end_date and end_date.strip():
+                end_dt = datetime.strptime(end_date.strip(), "%Y-%m-%d")
+            else:
+                end_dt = datetime.now()
+            
+            days_diff = (end_dt - start_dt).days
+            
+            # IB requires duration in specific formats
+            if days_diff <= 365:
+                duration_str = f"{max(1, days_diff)} D"
+            else:
+                years = max(1, int(np.ceil(days_diff / 365.0)))
+                duration_str = f"{years} Y"
+                
+        except ValueError:
+            print(f"[DOWNLOAD] Invalid start date format: {start_date}. Using default duration.")
+            duration_str = duration_from_startdate(START_DATE)
+    else:
+        # Use the original logic
+        duration_str = duration_from_startdate(START_DATE)
+
+    print(f"[DOWNLOAD] {symbol}: duration={duration_str}, end={end_datetime}")
+
+    # Try multiple approaches like the original function
+    ladders = [
+        (duration_str, "TRADES", USE_RTH),
+        (duration_str, "ADJUSTED_LAST", USE_RTH),
+        ("5 Y", "TRADES", USE_RTH),  # fallback
+        ("5 Y", "ADJUSTED_LAST", USE_RTH),
+        ("1 Y", "TRADES", USE_RTH),
+        ("1 Y", "ADJUSTED_LAST", USE_RTH),
+    ]
+
+    for dur, wts, rth in ladders:
+        try:
+            bars = fetch_hist_once(
+                app,
+                symbol=symbol,
+                contract=contract,
+                duration_str=dur,
+                bar_size=BAR_SIZE,
+                what_to_show=wts,
+                use_rth=rth,
+                end_datetime=end_datetime,
+            )
+            df = upsert_bars_into_df(pd.DataFrame(), symbol, bars)
+            
+            if not df.empty and all(
+                c in df.columns for c in ["open", "high", "low", "close"]
+            ):
+                # Filter data to the requested date range if specified
+                if start_date and start_date.strip():
+                    start_filter = pd.to_datetime(start_date.strip())
+                    df = df[df.index >= start_filter]
+                
+                if end_date and end_date.strip():
+                    end_filter = pd.to_datetime(end_date.strip()) + pd.Timedelta(days=1)
+                    df = df[df.index < end_filter]
+                
+                result = df[["symbol", "open", "high", "low", "close", "volume"]].dropna()
+                
+                # Apply strategy preparation
+                return strategy.prepare(result)
+                
+        except Exception as e:
+            print(f"[DOWNLOAD][{symbol}][retry] {dur}/{wts}/RTH={rth} failed: {e}")
+        time.sleep(0.5)
+
+    print(f"[DOWNLOAD][{symbol}] No historical data after retries — skipping.")
+    return pd.DataFrame()
 
 
 def place_paper_orders_now(
