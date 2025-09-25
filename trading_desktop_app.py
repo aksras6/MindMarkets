@@ -243,6 +243,8 @@ class WalkForwardEngine:
         self.results = []
         self.is_running = False
         self.stop_requested = False
+        self.start_time = None  # Add this
+        self.window_times = []  # Add this
 
     def run_walk_forward(
         self,
@@ -275,6 +277,8 @@ class WalkForwardEngine:
         self.results = []
         self.is_running = True
         self.stop_requested = False
+        self.start_time = time.time()  # Add this at the start
+        self.window_times = []
 
         try:
             # Get date range from data
@@ -309,18 +313,24 @@ class WalkForwardEngine:
             if callback:
                 callback(f"Generated {total_windows} walk-forward windows", "info")
 
-            # Process each window
+            # Process each window with detailed progress
             for i, window in enumerate(windows):
+                window_start_time = time.time()  # Add this
                 if self.stop_requested:
+                    if callback:
+                        callback("Walk-forward analysis stopped by user", "info")
                     break
 
                 train_start, train_end, test_start, test_end = window
                 
+                # Calculate overall progress
+                overall_progress = (i / total_windows) * 100
+                
                 if callback:
-                    progress = (i / total_windows) * 100
                     callback(
-                        f"Window {i+1}/{total_windows}: Training {train_start.date()} to {train_end.date()}, "
-                        f"Testing {test_start.date()} to {test_end.date()} ({progress:.1f}%)",
+                        f"Processing window {i+1}/{total_windows} ({overall_progress:.1f}%): "
+                        f"Training {train_start.date()} to {train_end.date()}, "
+                        f"Testing {test_start.date()} to {test_end.date()}",
                         "progress"
                     )
 
@@ -335,9 +345,14 @@ class WalkForwardEngine:
                         callback(f"Window {i+1}: Insufficient training data ({train_bars} bars)", "warning")
                     continue
 
-                # Optimize on training data
+                # Report optimization phase
+                if callback:
+                    callback(f"Window {i+1}: Optimizing parameters on training data...", "info")
+
+                # Optimize on training data with sub-progress
                 best_params = self._optimize_on_training_data(
-                    train_data, strategy_name, param_ranges, optimization_metric
+                    train_data, strategy_name, param_ranges, optimization_metric, 
+                    callback=lambda msg: callback(f"Window {i+1} - {msg}", "info") if callback else None
                 )
 
                 if not best_params:
@@ -345,10 +360,19 @@ class WalkForwardEngine:
                         callback(f"Window {i+1}: Optimization failed", "warning")
                     continue
 
+                # Report testing phase
+                if callback:
+                    callback(f"Window {i+1}: Testing on out-of-sample data...", "info")
+
                 # Test on out-of-sample data
                 test_results = self._test_on_oos_data(
                     test_data, strategy_name, best_params
                 )
+
+                if not test_results:
+                    if callback:
+                        callback(f"Window {i+1}: Out-of-sample testing failed", "warning")
+                    continue
 
                 # Store results
                 window_result = {
@@ -365,11 +389,38 @@ class WalkForwardEngine:
 
                 self.results.append(window_result)
 
+                # Report window completion
+                oos_return = test_results.get("TotalReturnPct", "N/A")
+                if callback:
+                    callback(f"Window {i+1}: Complete - OOS Return: {oos_return}%", "info")
+
+                # Record window completion time
+                window_end_time = time.time()
+                window_duration = window_end_time - window_start_time
+                self.window_times.append(window_duration)
+                
+                # Calculate ETA
+                if len(self.window_times) >= 2:  # Need at least 2 windows for estimate
+                    avg_window_time = np.mean(self.window_times)
+                    remaining_windows = total_windows - (i + 1)
+                    eta_seconds = remaining_windows * avg_window_time
+                    eta_minutes = eta_seconds / 60
+                    
+                    if callback:
+                        if eta_minutes < 1:
+                            callback(f"ETA: {eta_seconds:.0f} seconds", "eta")
+                        else:
+                            callback(f"ETA: {eta_minutes:.1f} minutes", "eta")
+
             # Calculate aggregate statistics
+            if callback:
+                callback("Calculating aggregate statistics...", "info")
+            
             self._calculate_aggregate_stats()
 
             if callback:
-                callback("Walk-forward analysis completed successfully", "complete")
+                successful_windows = len(self.results)
+                callback(f"Walk-forward analysis completed: {successful_windows}/{total_windows} windows successful", "complete")
 
         except Exception as e:
             if callback:
@@ -422,8 +473,8 @@ class WalkForwardEngine:
                 filtered[symbol] = filtered_df
         return filtered
 
-    def _optimize_on_training_data(self, train_data, strategy_name, param_ranges, metric):
-        """Run optimization on training data"""
+    def _optimize_on_training_data(self, train_data, strategy_name, param_ranges, metric, callback=None):
+        """Run optimization on training data with progress reporting"""
         if not train_data:
             return None
             
@@ -436,10 +487,17 @@ class WalkForwardEngine:
             if not combinations:
                 return None
 
+            total_combinations = len(combinations)
+            if callback:
+                callback(f"Testing {total_combinations} parameter combinations")
+
             best_result = None
             best_score = float('-inf')
 
-            for params in combinations:
+            for idx, params in enumerate(combinations):
+                if self.stop_requested:
+                    break
+                    
                 try:
                     strategy = build_strategy(strategy_name, **params)
                     trades_df, summary, equity_df = backtest_portfolio(train_data, strategy)
@@ -458,9 +516,18 @@ class WalkForwardEngine:
                         best_score = score
                         best_result = params.copy()
 
+                    # Report progress every 10 combinations or on last one
+                    if (idx + 1) % 10 == 0 or idx == total_combinations - 1:
+                        progress = ((idx + 1) / total_combinations) * 100
+                        if callback:
+                            callback(f"Optimization progress: {progress:.1f}% ({idx+1}/{total_combinations})")
+
                 except Exception as e:
                     print(f"Training optimization error for params {params}: {e}")
                     continue
+
+            if callback and best_result:
+                callback(f"Best parameters found: {best_result} (score: {best_score:.3f})")
 
             return best_result
 
@@ -530,9 +597,11 @@ class WalkForwardEngine:
             "max_dd": "MaxDDPct",
         }
 
-    def stop_walk_forward(self):
+    def stop_analysis(self):  # Changed from stop_walk_forward
         """Stop running walk-forward analysis"""
         self.stop_requested = True
+
+    
 
     def get_aggregate_results(self):
         """Get aggregate walk-forward results"""
@@ -648,6 +717,91 @@ class TradingApp:
         # Status bar with multiple sections
         self.create_status_bar()
 
+    def _apply_date_range_filter(self, data_dict):
+        """Apply GUI date range filter to data"""
+        start_date_str = self.start_date_var.get().strip()
+        end_date_str = self.end_date_var.get().strip()
+        
+        # If no date range specified, return original data
+        if not start_date_str and not end_date_str:
+            return data_dict
+        
+        filtered_data = {}
+        
+        try:
+            # Parse dates
+            start_date = None
+            end_date = None
+            
+            if start_date_str:
+                start_date = pd.to_datetime(start_date_str)
+                self.log_message(f"Filtering data from: {start_date.date()}")
+            
+            if end_date_str:
+                end_date = pd.to_datetime(end_date_str) + pd.Timedelta(days=1)  # Include end date
+                self.log_message(f"Filtering data until: {end_date.date()}")
+            
+            # Filter each symbol's data
+            for symbol, df in data_dict.items():
+                if df.empty:
+                    continue
+                    
+                filtered_df = df.copy()
+                
+                # Apply start date filter
+                if start_date is not None:
+                    filtered_df = filtered_df[filtered_df.index >= start_date]
+                
+                # Apply end date filter  
+                if end_date is not None:
+                    filtered_df = filtered_df[filtered_df.index < end_date]
+                
+                # Only include if we have data after filtering
+                if not filtered_df.empty:
+                    filtered_data[symbol] = filtered_df
+                    self.log_message(f"Filtered {symbol}: {len(df)} -> {len(filtered_df)} bars")
+                else:
+                    self.log_message(f"No data for {symbol} in specified date range", "WARNING")
+        
+        except Exception as e:
+            self.log_message(f"Error applying date filter: {e}", "ERROR")
+            # Return original data if filtering fails
+            return data_dict
+        
+        if filtered_data:
+            self.log_message(f"Date range filtering complete: {len(filtered_data)} symbols with data")
+        else:
+            self.log_message("No data available after applying date range filter", "WARNING")
+        
+        return filtered_data
+    
+    def validate_backtest_date_range(self):
+        """Validate date range for backtesting"""
+        start_date_str = self.start_date_var.get().strip()
+        end_date_str = self.end_date_var.get().strip()
+        
+        if not start_date_str and not end_date_str:
+            return True  # No range specified is OK
+        
+        try:
+            if start_date_str:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+                
+            if end_date_str:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+                
+                if start_date_str:
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+                    if end_date <= start_date:
+                        messagebox.showerror("Error", "End date must be after start date")
+                        return False
+                        
+            return True
+            
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid date format. Use YYYY-MM-DD format.\nError: {e}")
+            return False
+
     def create_menu(self):
         """Create application menu"""
         menubar = tk.Menu(self.root)
@@ -742,6 +896,23 @@ class TradingApp:
             toolbar, text="● Disconnected", style="Disconnected.TLabel"
         )
         self.connection_status.pack(side=tk.RIGHT, padx=5)
+
+    def update_date_range_status(self, *args):
+        """Update date range status display"""
+        start_date = self.start_date_var.get().strip()
+        end_date = self.end_date_var.get().strip()
+        
+        if not start_date and not end_date:
+            status_text = "Date range: All available data"
+        elif start_date and end_date:
+            status_text = f"Date range: {start_date} to {end_date}"
+        elif start_date:
+            status_text = f"Date range: From {start_date}"
+        else:
+            status_text = f"Date range: Until {end_date}"
+        
+        if hasattr(self, 'date_range_status'):
+            self.date_range_status.config(text=status_text)
 
     def create_config_panel(self):
         """Create configuration panel in left frame"""
@@ -844,6 +1015,16 @@ class TradingApp:
         )
         data_type_combo.grid(row=3, column=1, padx=5, pady=2)
 
+        # Add date range status display
+        self.date_range_status = ttk.Label(
+            data_frame, text="Date range: All available data", foreground="blue"
+        )
+        self.date_range_status.grid(row=4, column=0, columnspan=2, pady=2)
+
+        # Bind events to update status when dates change
+        self.start_date_var.trace('w', self.update_date_range_status)
+        self.end_date_var.trace('w', self.update_date_range_status)
+
         # Strategy Settings with save button
         strat_frame = ttk.LabelFrame(self.left_frame, text="Strategy")
         strat_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -920,6 +1101,29 @@ class TradingApp:
 
         self.symbols_text.bind("<KeyRelease>", self.update_symbol_count)
 
+    def stop_walk_forward(self):
+        """Stop walk-forward analysis with error handling"""
+        try:
+            if hasattr(self, 'walkforward') and hasattr(self.walkforward, 'stop_analysis'):
+                self.walkforward.stop_analysis()
+            else:
+                self.log_message("Walk-forward engine not properly initialized", "WARNING")
+        except Exception as e:
+            self.log_message(f"Error stopping walk-forward analysis: {e}", "ERROR")
+        
+        # Reset UI components regardless of error
+        try:
+            self.wf_progress.config(value=0)
+            self.wf_progress_label.config(text="Stopped")
+            
+            if hasattr(self, 'wf_eta_label'):
+                self.wf_eta_label.config(text="")
+            if hasattr(self, 'wf_current_window_label'):
+                self.wf_current_window_label.config(text="")
+            
+            self.update_status("Walk-forward analysis stopped")
+        except Exception as e:
+            self.log_message(f"Error resetting UI: {e}", "ERROR")
 
     def on_wf_strategy_change(self, event=None):
         """Handle walk-forward strategy change"""
@@ -1007,42 +1211,59 @@ class TradingApp:
             messagebox.showerror("Error", "Invalid time period values")
             return
 
+        # Initialize progress
         self.update_status("Starting walk-forward analysis...")
         self.wf_progress.config(mode="determinate", maximum=100, value=0)
+        self.wf_progress_label.config(text="Initializing...")
 
         def wf_callback(message, msg_type):
+            """Enhanced callback with better progress tracking"""
             if msg_type == "progress":
-                if "%" in message:
+                # Extract progress percentage from message
+                if "(" in message and "%" in message:
                     try:
-                        progress = float(message.split("(")[1].split("%")[0])
-                        self.wf_progress.config(value=progress)
+                        # Look for pattern like "(45.2%)"
+                        import re
+                        match = re.search(r'\((\d+\.?\d*)%\)', message)
+                        if match:
+                            progress = float(match.group(1))
+                            # Use queue to update progress bar safely from thread
+                            self.message_queue.put(("wf_progress_value", progress))
                     except:
                         pass
+            
+            # Send all messages to the main thread for processing
             self.message_queue.put((f"wf_{msg_type}", message))
 
         def run_wf():
-            self.walkforward.run_walk_forward(
-                symbols=list(self.data_cache.keys()),
-                strategy_name=strategy,
-                param_ranges=param_ranges,
-                data_dict=self.data_cache,
-                training_months=training_months,
-                testing_months=testing_months, 
-                reoptimize_months=reoptimize_months,
-                optimization_metric=self.wf_metric_var.get(),
-                callback=wf_callback,
-            )
+            try:
+                self.walkforward.run_walk_forward(
+                    symbols=list(self.data_cache.keys()),
+                    strategy_name=strategy,
+                    param_ranges=param_ranges,
+                    data_dict=self.data_cache,
+                    training_months=training_months,
+                    testing_months=testing_months, 
+                    reoptimize_months=reoptimize_months,
+                    optimization_metric=self.wf_metric_var.get(),
+                    callback=wf_callback,
+                )
 
-            # Display results
-            aggregate_stats, window_results = self.walkforward.get_aggregate_results()
-            self.message_queue.put(("wf_results", (aggregate_stats, window_results)))
+                # Display results
+                aggregate_stats, window_results = self.walkforward.get_aggregate_results()
+                self.message_queue.put(("wf_results", (aggregate_stats, window_results)))
+                
+            except Exception as e:
+                self.message_queue.put(("wf_error", f"Walk-forward analysis failed: {str(e)}"))
+            finally:
+                self.message_queue.put(("wf_done", None))
 
         self.run_in_thread(run_wf)
 
-    def stop_walk_forward(self):
-        """Stop walk-forward analysis"""
-        self.walkforward.stop_walk_forward()
-        self.update_status("Walk-forward analysis stopped")
+    # def stop_walk_forward(self):
+    #     """Stop walk-forward analysis"""
+    #     self.walkforward.stop_walk_forward()
+    #     self.update_status("Walk-forward analysis stopped")
 
     def display_wf_results(self, aggregate_stats, window_results):
         """Display walk-forward results"""
@@ -1443,6 +1664,26 @@ class TradingApp:
         # Window results tab
         window_results_frame = ttk.Frame(wf_results_notebook)
         wf_results_notebook.add(window_results_frame, text="Window Results")
+
+        # Enhanced Progress section
+        progress_frame = ttk.LabelFrame(wf_controls_frame, text="Progress")
+        progress_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Main progress bar
+        self.wf_progress = ttk.Progressbar(progress_frame, mode="determinate")
+        self.wf_progress.pack(fill=tk.X, padx=5, pady=2)
+
+        # Progress label
+        self.wf_progress_label = ttk.Label(progress_frame, text="Ready")
+        self.wf_progress_label.pack(pady=2)
+
+        # Add a current window indicator
+        self.wf_current_window_label = ttk.Label(progress_frame, text="", foreground="blue")
+        self.wf_current_window_label.pack(pady=1)
+
+        # Add estimated time remaining (optional)
+        self.wf_eta_label = ttk.Label(progress_frame, text="", foreground="gray")
+        self.wf_eta_label.pack(pady=1)
 
         self.wf_results_tree = ttk.Treeview(
             window_results_frame,
@@ -2954,6 +3195,10 @@ class TradingApp:
         if not self.data_cache:
             messagebox.showwarning("Warning", "No data available. Download data first.")
             return
+        
+        # **ADD: Validate date range**
+        if not self.validate_backtest_date_range():
+            return
 
         self.update_status("Running quick backtest...")
         self.backtest_progress.start()
@@ -2964,8 +3209,15 @@ class TradingApp:
                 strategy_params = self.get_strategy_params()
                 strategy = build_strategy(self.strategy_var.get(), **strategy_params)
 
+                # **FIX: Apply date range filtering**
+                filtered_data = self._apply_date_range_filter(self.data_cache)
+                
+                if not filtered_data:
+                    self.message_queue.put(("error", "No data available after applying date range filter"))
+                    return
+
                 # Use only first 5 symbols for quick test
-                limited_data = dict(list(self.data_cache.items())[:5])
+                limited_data = dict(list(filtered_data.items())[:5])
 
                 trades_df, summary, equity_df = backtest_portfolio(
                     limited_data, strategy
@@ -2994,6 +3246,10 @@ class TradingApp:
         if not self.data_cache:
             messagebox.showwarning("Warning", "No data available. Download data first.")
             return
+        
+        # **ADD: Validate date range**
+        if not self.validate_backtest_date_range():
+            return
 
         self.backtest_progress.start()
         self.backtest_output.delete(1.0, tk.END)
@@ -3005,10 +3261,43 @@ class TradingApp:
                 strategy_params = self.get_strategy_params()
                 strategy = build_strategy(self.strategy_var.get(), **strategy_params)
 
+                # Show date range being applied
+                start_date_str = self.start_date_var.get().strip()
+                end_date_str = self.end_date_var.get().strip()
+                
+                if start_date_str or end_date_str:
+                    range_msg = f"Applying date range filter: "
+                    if start_date_str:
+                        range_msg += f"from {start_date_str} "
+                    if end_date_str:
+                        range_msg += f"to {end_date_str}"
+                    self.message_queue.put(("progress", range_msg))
+
+                self.message_queue.put(("progress", "Preparing backtest data..."))
+
+                # **FIX: Apply date range filtering to cached data**
+                filtered_data = self._apply_date_range_filter(self.data_cache)
+                
+                if not filtered_data:
+                    self.message_queue.put(("error", "No data available after applying date range filter"))
+                    return
+                
+                # Show data summary
+                total_symbols = len(filtered_data)
+                date_ranges = []
+                for symbol, df in filtered_data.items():
+                    if not df.empty:
+                        date_ranges.append(f"{df.index.min().date()} to {df.index.max().date()}")
+                
+                if date_ranges:
+                    overall_start = min(date_ranges)
+                    overall_end = max(date_ranges)
+                    self.message_queue.put(("progress", f"Using {total_symbols} symbols, data range: {overall_start} to {overall_end}"))
+
                 self.message_queue.put(("progress", "Running backtest calculations..."))
 
                 trades_df, summary, equity_df = backtest_portfolio(
-                    self.data_cache, strategy
+                    filtered_data, strategy  # Use filtered data instead of self.data_cache
                 )
 
                 # Save results
@@ -3331,6 +3620,17 @@ class TradingApp:
         if not self.data_cache:
             messagebox.showwarning("Warning", "No data available for comparison")
             return
+        
+        # Validate date range
+        if not self.validate_backtest_date_range():
+            return
+
+        # Apply date range filter
+        filtered_data = self._apply_date_range_filter(self.data_cache)
+        
+        if not filtered_data:
+            messagebox.showwarning("Warning", "No data available after applying date range filter")
+            return
 
         # Create strategy comparison dialog
         comparison_window = tk.Toplevel(self.root)
@@ -3379,7 +3679,7 @@ class TradingApp:
                 try:
                     strategy = build_strategy(strategy_name)
                     trades_df, summary, equity_df = backtest_portfolio(
-                        self.data_cache, strategy
+                        filtered_data, strategy
                     )
 
                     comparison_tree.insert(
@@ -3837,6 +4137,9 @@ professional-grade tools and reliability.
                     self.update_status("Error occurred")
                     self.log_message(msg_data, "ERROR")
 
+                elif msg_type == "wf_eta":
+                    self.wf_eta_label.config(text=f"Estimated time remaining: {msg_data}")
+
                 elif msg_type == "success":
                     messagebox.showinfo("Success", msg_data)
                     self.update_status("Operation completed successfully")
@@ -3935,6 +4238,14 @@ professional-grade tools and reliability.
                     self.wf_progress_label.config(text=msg_data)
                     self.update_status(msg_data)
 
+                elif msg_type == "wf_progress_value":
+                    # Direct progress bar value update
+                    try:
+                        progress_value = float(msg_data)
+                        self.wf_progress.config(value=progress_value)
+                    except (ValueError, TypeError):
+                        pass
+
                 elif msg_type == "wf_info":
                     self.update_status(msg_data)
                     self.log_message(msg_data)
@@ -3946,16 +4257,26 @@ professional-grade tools and reliability.
                     messagebox.showerror("Walk-Forward Error", msg_data)
                     self.update_status("Walk-forward analysis failed")
                     self.log_message(msg_data, "ERROR")
+                    # Reset progress bar
+                    self.wf_progress.config(value=0)
+                    self.wf_progress_label.config(text="Failed")
 
                 elif msg_type == "wf_complete":
                     self.wf_progress.config(value=100)
-                    self.wf_progress_label.config(text="Walk-forward analysis complete")
+                    self.wf_progress_label.config(text="Analysis complete")
                     self.update_status("Walk-forward analysis completed")
                     messagebox.showinfo("Success", msg_data)
 
                 elif msg_type == "wf_results":
                     aggregate_stats, window_results = msg_data
                     self.display_wf_results(aggregate_stats, window_results)
+
+                elif msg_type == "wf_done":
+                    # Reset progress components
+                    self.wf_progress.config(value=0)
+                    if not hasattr(self, '_wf_completed'):
+                        self.wf_progress_label.config(text="Ready")
+                    self._wf_completed = False
 
         except queue.Empty:
             pass

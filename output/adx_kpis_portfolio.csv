@@ -1,0 +1,2 @@
+Strategy,BarsUsed,StartEquity,FinalEquity,TotalReturnPct,CAGR,ROR,MaxDDPct,Calmar,Sharpe,Trades,PctWins,ProfitFactor,NetProfit,AnnVolPct
+ADX Squeeze Breakout (Long),2627,10000.0,29363.38,193.63,10.89,193.63,11.16,0.976,1.257,92,57.61,4.71,19363.38,8.51

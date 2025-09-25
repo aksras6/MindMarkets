@@ -1,0 +1,17 @@
+{
+  "Strategy": "ADX Squeeze Breakout (Long)",
+  "BarsUsed": 2627,
+  "StartEquity": 10000.0,
+  "FinalEquity": 29363.38,
+  "TotalReturnPct": 193.63,
+  "CAGR": 10.89,
+  "ROR": 193.63,
+  "MaxDDPct": 11.16,
+  "Calmar": 0.976,
+  "Sharpe": 1.257,
+  "Trades": 92,
+  "PctWins": 57.61,
+  "ProfitFactor": 4.71,
+  "NetProfit": 19363.38,
+  "AnnVolPct": 8.51
+}
